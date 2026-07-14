@@ -15,6 +15,7 @@ llm.py — 大模型调用工具
 
 import json
 import time
+from typing import Union
 from openai import OpenAI
 from src.config import OPENAI_API_KEY, OPENAI_MODEL
 
@@ -29,7 +30,7 @@ def call_llm(
     temperature: float = 0.3,
     max_tokens: int = 4096,
     max_retries: int = 3,
-) -> dict | str:
+) -> Union[dict, str]:
     """
     调用大模型（最常用的函数）
 

@@ -63,22 +63,26 @@ class FFmpegTool:
         if ffmpeg_path:
             return ffmpeg_path
 
-        # 方式2：搜索常见安装位置
-        common_paths = [
-            Path("C:/Program Files/FFmpeg/bin/ffmpeg.exe"),
-            Path("C:/ffmpeg/bin/ffmpeg.exe"),
-            Path.home() / "ffmpeg" / "bin" / "ffmpeg.exe",
-        ]
-        # 如果通过 winget 安装的 Gyan.FFmpeg，路径在用户目录下
-        winget_path = Path("C:/Users") / Path.home().name
-        for p in winget_path.glob("**/ffmpeg.exe"):
-            common_paths.append(p)
+        # 方式2：使用 imageio_ffmpeg 自带的 FFmpeg（跨平台，不需要额外安装）
+        try:
+            import imageio_ffmpeg
+            bundled = imageio_ffmpeg.get_ffmpeg_exe()
+            if Path(bundled).exists():
+                return bundled
+        except (ImportError, Exception):
+            pass
 
+        # 方式3：搜索常见安装位置
+        common_paths = [
+            Path("C:/Program Files/FFmpeg/bin/ffmpeg.exe"),     # Windows
+            Path("/opt/homebrew/bin/ffmpeg"),                    # Mac Homebrew
+            Path("/usr/local/bin/ffmpeg"),                       # Mac Intel / Linux
+        ]
         for p in common_paths:
             if p.exists():
                 return str(p)
 
-        # 方式3：都找不到就返回 "ffmpeg"，
+        # 方式4：都找不到就返回 "ffmpeg"，
         # 让 subprocess 报错，用户能看到明确的错误信息
         return "ffmpeg"
 
