@@ -25,6 +25,8 @@ Python 知识点：
 from src.agents.base import BaseAgent
 from src.tools.llm import call_llm
 from src.tools.whisper import WhisperTool
+from src.tools.ffmpeg import FFmpegTool
+from src.config import WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_MODEL_SIZE
 from src.models.schemas import (
     VideoRequirement,
     TranscriptSegment,
@@ -82,11 +84,12 @@ class AnalysisAgent(BaseAgent):
             print(f"[{clip.importance}] {clip.start}-{clip.end}: {clip.reason}")
     """
 
-    def __init__(self, whisper_model_size: str = "large-v3"):
+    def __init__(self, whisper_model_size: str = WHISPER_MODEL_SIZE):
         super().__init__("AnalysisAgent")
         self.whisper = WhisperTool(
             model_size=whisper_model_size,
-            device="cuda",  # 用你的 RTX 4060
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
         )
 
     def run(
@@ -119,8 +122,9 @@ class AnalysisAgent(BaseAgent):
             TranscriptSegment(**seg) for seg in raw_segments
         ]
 
-        # 计算视频总时长
-        video_duration = transcript[-1].end if transcript else 0
+        # 视频时长必须来自媒体文件；最后一句话之后可能仍有无声画面。
+        media_info = FFmpegTool.get_video_info(video_path)
+        video_duration = float(media_info["duration"]) if media_info else (transcript[-1].end if transcript else 0)
         self.log(f"视频总时长: {video_duration:.0f} 秒 ({video_duration/60:.1f} 分钟)")
 
         # ============================================
@@ -128,18 +132,15 @@ class AnalysisAgent(BaseAgent):
         # ============================================
         self.log("Step 2/3: LLM 分析关键片段...")
 
-        # 分块策略：每 20 个转录片段为一组，重叠 5 个（防止关键内容被切断）
-        CHUNK_SIZE = 20
-        OVERLAP = 5
-
         all_highlights = []
-        chunks = self._split_transcript(transcript, CHUNK_SIZE, OVERLAP)
+        chunks = self._split_transcript(transcript, max_duration=120.0, overlap_duration=15.0)
 
         self.log(f"分为 {len(chunks)} 个文本块进行分析")
 
         for i, chunk in enumerate(chunks):
             # 构建发给 LLM 的文本
             chunk_text = self._format_chunk(chunk, requirement)
+            chunk_start, chunk_end = chunk[0].start, chunk[-1].end
 
             try:
                 response = call_llm(
@@ -152,8 +153,11 @@ class AnalysisAgent(BaseAgent):
                 # 提取高光片段
                 if "highlights" in response:
                     for h in response["highlights"]:
-                        # 只保留在合理时间范围内的片段
-                        if 0 <= h.get("start", 0) <= video_duration:
+                        # 只接受当前文本块内且位于原视频范围内的时间戳。
+                        if (
+                            chunk_start <= h.get("start", -1) < h.get("end", -1) <= chunk_end
+                            and h.get("end", 0) <= video_duration
+                        ):
                             try:
                                 clip = HighlightClip(**h)
                                 all_highlights.append(clip)
@@ -209,8 +213,8 @@ class AnalysisAgent(BaseAgent):
     def _split_transcript(
         self,
         transcript: list[TranscriptSegment],
-        chunk_size: int,
-        overlap: int,
+        max_duration: float,
+        overlap_duration: float,
     ) -> list[list[TranscriptSegment]]:
         """
         把转录文本切成小块（滑动窗口分块）
@@ -219,12 +223,23 @@ class AnalysisAgent(BaseAgent):
         如果不重叠，一个关键片段可能刚好被切在两块的边界上。
         重叠 5 个片段可以保证边界处的内容也被分析到。
         """
-        chunks = []
-        step = chunk_size - overlap  # 实际步长
-        for i in range(0, len(transcript), step):
-            chunk = transcript[i : i + chunk_size]
-            if chunk:
-                chunks.append(chunk)
+        chunks: list[list[TranscriptSegment]] = []
+        start_index = 0
+        while start_index < len(transcript):
+            chunk: list[TranscriptSegment] = []
+            chunk_start = transcript[start_index].start
+            index = start_index
+            while index < len(transcript) and transcript[index].end - chunk_start <= max_duration:
+                chunk.append(transcript[index])
+                index += 1
+            if not chunk:
+                chunk = [transcript[start_index]]
+                index = start_index + 1
+            chunks.append(chunk)
+            if index >= len(transcript):
+                break
+            next_start = chunk[-1].end - overlap_duration
+            start_index = next((i for i, segment in enumerate(transcript) if i > start_index and segment.start >= next_start), index)
         return chunks
 
     def _format_chunk(
@@ -237,6 +252,7 @@ class AnalysisAgent(BaseAgent):
         lines.append(f"视频类型: {requirement.video_type}")
         lines.append(f"关注重点: {', '.join(requirement.focus_keywords)}")
         lines.append(f"剪辑风格: {requirement.style}")
+        lines.append(f"允许输出的时间范围: {chunk[0].start:.2f}s - {chunk[-1].end:.2f}s")
         lines.append("")
         lines.append("以下是视频的语音转录（带时间戳）：")
         lines.append("---")
@@ -261,26 +277,16 @@ class AnalysisAgent(BaseAgent):
         if not clips:
             return []
 
-        # 按开始时间排序
-        sorted_clips = sorted(clips, key=lambda x: x.start)
-        kept = [sorted_clips[0]]
-
-        for clip in sorted_clips[1:]:
-            last = kept[-1]
-            overlap_start = max(clip.start, last.start)
-            overlap_end = min(clip.end, last.end)
-
-            if overlap_start < overlap_end:
-                # 有重叠
-                overlap_duration = overlap_end - overlap_start
-                shorter_duration = min(clip.end - clip.start, last.end - last.start)
-                if shorter_duration > 0 and overlap_duration / shorter_duration > overlap_threshold:
-                    # 重叠超过阈值，保留更重要的那个
-                    if clip.importance > last.importance:
-                        kept[-1] = clip
-                else:
-                    kept.append(clip)
-            else:
+        kept: list[HighlightClip] = []
+        for clip in sorted(clips, key=lambda item: item.importance, reverse=True):
+            duplicate = False
+            for existing in kept:
+                intersection = max(0.0, min(clip.end, existing.end) - max(clip.start, existing.start))
+                shorter = min(clip.end - clip.start, existing.end - existing.start)
+                if shorter > 0 and intersection / shorter > overlap_threshold:
+                    duplicate = True
+                    break
+            if not duplicate:
                 kept.append(clip)
 
         return kept
@@ -342,7 +348,7 @@ if __name__ == "__main__":
     # 用 tiny 模型测试（更快），不用加载 large-v3
     agent = AnalysisAgent(whisper_model_size="tiny")
 
-    test_video = Path("C:/Users/22307/video-agent-pipeline/data/test.mp4")
+    test_video = Path("data/test.mp4")
     if test_video.exists():
         from src.models.schemas import VideoRequirement
 

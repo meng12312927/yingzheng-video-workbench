@@ -48,10 +48,12 @@ class VideoRequirement(BaseModel):
         style="exciting",
         focus_keywords=["冲刺", "欢呼", "颁奖"],
         need_subtitles=True,
-        need_bgm=True,
+        need_bgm=False,
     )
     """
     target_duration: int = Field(
+        ge=30,
+        le=600,
         description="目标成品时长（秒），如 180 表示 3 分钟"
     )
     video_type: str = Field(
@@ -69,8 +71,8 @@ class VideoRequirement(BaseModel):
         description="是否需要烧录字幕"
     )
     need_bgm: bool = Field(
-        default=True,
-        description="是否建议添加背景音乐（实际添加需用户提供音乐文件）"
+        default=False,
+        description="是否建议添加背景音乐；MVP 不会自动添加，需用户自行提供已授权音频"
     )
     avoid_keywords: list[str] = Field(
         default_factory=list,
@@ -213,6 +215,38 @@ class EditScript(BaseModel):
     srt_subtitles: str = Field(
         default="",
         description="SRT 格式的字幕内容（完整的文本块）"
+    )
+    subtitle_style: str = Field(
+        default="classic",
+        description="字幕样式：classic / clean / highlight"
+    )
+    transition_duration: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="相邻片段淡转场时长（秒）；0 表示硬切"
+    )
+    bgm_path: Optional[str] = Field(
+        default=None,
+        description="用户提供的背景音乐文件路径；为空则不添加 BGM"
+    )
+    bgm_volume: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="背景音乐相对音量"
+    )
+    intro_style: str = Field(
+        default="none",
+        description="片头样式：none / title / fade_black"
+    )
+    outro_style: str = Field(
+        default="none",
+        description="片尾样式：none / title / fade_black"
+    )
+    title_text: str = Field(
+        default="",
+        description="片头主标题；片尾默认显示感谢观看"
     )
     notes: str = Field(
         default="",

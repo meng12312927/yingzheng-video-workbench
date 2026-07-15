@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 from faster_whisper import WhisperModel
 from pathlib import Path
+from src.config import WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_MODEL_SIZE
 
 
 class WhisperTool:
-    def __init__(self,model_size: str = "large-v3",device: str = "cuda",compute_type: str = "float16"):
+    def __init__(
+        self,
+        model_size: str = WHISPER_MODEL_SIZE,
+        device: str = WHISPER_DEVICE,
+        compute_type: str = WHISPER_COMPUTE_TYPE,
+    ):
        
         print(f"[Whisper] 正在加载模型 '{model_size}'，设备: {device}...")
-        print(f"[Whisper] （首次运行会下载约 1.5GB 模型文件，请耐心等待）")
+        print("[Whisper] （首次运行会下载约 1.5GB 模型文件，请耐心等待）")
 
         # WhisperModel 是 Faster-Whisper 提供的核心类
         # 它会自动从 HuggingFace 下载模型到本地缓存
@@ -17,7 +23,7 @@ class WhisperTool:
             compute_type=compute_type,
         )
         self.device = device
-        print(f"[Whisper] 模型加载完成！")
+        print("[Whisper] 模型加载完成！")
 
     def transcribe(self, video_path: str, language: str = "zh") -> list[dict]:
         """
@@ -110,7 +116,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 创建工具实例
-    tool = WhisperTool(model_size="tiny", device="cuda")
+    tool = WhisperTool(model_size="tiny")
     # 注意：这里用 "tiny" 模型，因为只是测试，不需要大模型
     # 正式使用时改成 "large-v3"
 

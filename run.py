@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def check_environment():
     """检查运行环境是否就绪"""
-    import shutil
+    from src.tools.ffmpeg import FFmpegTool
 
     issues = []
 
@@ -40,8 +40,9 @@ def check_environment():
         )
 
     # 2. 检查 FFmpeg
-    if not shutil.which("ffmpeg"):
-        issues.append("未找到 FFmpeg！请先安装 FFmpeg。")
+    ffmpeg_path = FFmpegTool._find_ffmpeg()
+    if ffmpeg_path == "ffmpeg":
+        issues.append("未找到 FFmpeg！请先安装 FFmpeg（macOS：brew install ffmpeg）。")
 
     # 3. 检查 data 目录
     data_dir = PROJECT_ROOT / "data"
@@ -101,12 +102,38 @@ def run_cli():
         if not user_input:
             user_input = "帮我把这个视频剪成3分钟精彩集锦"
 
-    print(f"\n启动剪辑流水线...")
+    print("\n正在生成剪辑方案...")
     print(f"  视频: {video_path}")
     print(f"  需求: {user_input}")
 
     orchestrator = VideoEditOrchestrator()
-    result = orchestrator.run(video_path, user_input)
+    try:
+        script = orchestrator.prepare(video_path, user_input)
+    except Exception as error:
+        print(f"\n❌ 生成方案失败: {error}")
+        return
+
+    if not script.operations:
+        print("\n❌ 未找到可导出的候选片段，请调整需求或检查音频质量。")
+        return
+
+    print("\n候选片段：")
+    for operation in script.operations:
+        print(
+            f"  [{operation.order}] {operation.source_start:.1f}s - {operation.source_end:.1f}s"
+            f"  {operation.note or ''}"
+        )
+    choice = input("保留片段编号（逗号分隔，直接回车=全部保留）: ").strip()
+    try:
+        selected_orders = (
+            [int(value.strip()) for value in choice.split(",") if value.strip()]
+            if choice
+            else [operation.order for operation in script.operations]
+        )
+        result = orchestrator.confirm_and_render(script, selected_orders, video_path)
+    except (ValueError, EOFError) as error:
+        print(f"\n❌ 导出失败: {error}")
+        return
 
     if result.success:
         print(f"\n✅ 剪辑完成！成品: {result.output_path}")
@@ -121,10 +148,11 @@ def run_ui():
     try:
         from src.ui.app import create_ui
         demo = create_ui()
-        demo.launch(share=False)  # share=True 可生成公网链接
-    except ImportError:
-        print("UI 模块尚未完成！将在后续课程中实现。")
-        print("现在请使用命令行模式: python run.py <视频路径> <需求>")
+        from src.config import GRADIO_SERVER_PORT
+        demo.launch(server_name="127.0.0.1", server_port=GRADIO_SERVER_PORT, share=False)
+    except ImportError as error:
+        print(f"缺少 UI 依赖: {error}")
+        print("请先执行: .venv/bin/pip install -r requirements.txt")
 
 
 if __name__ == "__main__":

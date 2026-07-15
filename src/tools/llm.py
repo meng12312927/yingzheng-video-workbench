@@ -17,10 +17,10 @@ import json
 import time
 from typing import Union
 from openai import OpenAI
-from src.config import OPENAI_API_KEY, OPENAI_MODEL
+from src.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 
-# 全局客户端（单例，整个程序共用一个连接）
-_client = OpenAI(api_key=OPENAI_API_KEY)
+# OpenAI SDK 同时用于 OpenAI 与 DeepSeek 等 OpenAI 兼容服务。
+_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 
 def call_llm(
@@ -53,7 +53,7 @@ def call_llm(
     for attempt in range(max_retries):
         try:
             kwargs = {
-                "model": OPENAI_MODEL,
+                "model": LLM_MODEL,
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -114,10 +114,8 @@ if __name__ == "__main__":
     print("LLM 工具测试")
     print("=" * 60)
 
-    if not OPENAI_API_KEY:
-        print("请先在 .env 文件中设置 OPENAI_API_KEY")
-        print("  1. 复制 .env.example 为 .env")
-        print("  2. 编辑 .env，填入你的 API Key")
+    if not LLM_API_KEY:
+        print("请先在 .env 或 .env.deepseek 文件中设置 LLM_API_KEY")
     else:
         print("测试 JSON 返回...")
         result = call_llm(

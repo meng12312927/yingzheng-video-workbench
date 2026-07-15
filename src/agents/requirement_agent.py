@@ -73,14 +73,14 @@ SYSTEM_PROMPT = """你是一个专业的视频剪辑需求分析师。你的任�
   "style": "exciting",
   "focus_keywords": ["冲刺", "欢呼", "颁奖"],
   "need_subtitles": true,
-  "need_bgm": true,
+  "need_bgm": false,
   "avoid_keywords": [],
   "output_format": "mp4"
 }
 
 ## 注意事项
 - focus_keywords 至少给 3 个，最多 8 个
-- 如果用户没提到字幕/配乐，默认都需要
+- 如果用户没提到字幕，默认需要；配乐默认不需要，MVP 不会自动添加背景音乐
 - 只返回 JSON，不要任何其他文字
 """
 

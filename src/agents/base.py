@@ -25,14 +25,11 @@ import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
 
-# 配置 logging：同时输出到控制台和文件
+# 库模块只配置日志名称；应用入口负责决定日志写到哪里，避免 import 时在项目根目录生成文件。
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("pipeline.log", encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 
 

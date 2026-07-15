@@ -71,6 +71,9 @@ class ExecutorAgent(BaseAgent):
         log_lines = []
 
         # 1. 准备输出路径
+        source_info = FFmpegTool.get_video_info(video_path)
+        if not source_info:
+            return self._fail(["无法读取输入视频，请确认文件可被 FFmpeg 解码"], log_lines)
         if not output_path:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = str(
@@ -95,6 +98,10 @@ class ExecutorAgent(BaseAgent):
             for op in sorted(cut_ops, key=lambda x: x.order):
                 if op.source_start is None or op.source_end is None:
                     self.log(f"跳过操作 #{op.order}: 缺少时间信息", level="warning")
+                    failed += 1
+                    continue
+                if not (0 <= op.source_start < op.source_end <= source_info["duration"]):
+                    errors.append(f"裁剪片段 #{op.order} 时间范围超出原视频")
                     failed += 1
                     continue
 
@@ -124,7 +131,9 @@ class ExecutorAgent(BaseAgent):
             log_lines.append(f"拼接片段数: {len(segment_paths)}")
 
             merged_path = str(temp_dir / "merged.mp4")
-            success = FFmpegTool.concat_segments(segment_paths, merged_path)
+            success = FFmpegTool.concat_segments(
+                segment_paths, merged_path, transition_duration=script.transition_duration
+            )
 
             if not success:
                 errors.append("拼接失败！")
@@ -133,7 +142,63 @@ class ExecutorAgent(BaseAgent):
             done += 1
 
             # ============================================
-            # 第三步：烧录字幕
+            # 第三步：按用户选择添加片头和片尾
+            # ============================================
+            decorated_source = merged_path
+            card_paths = []
+            card_options = (
+                ("片头", script.intro_style, script.title_text or script.title or "精彩回顾"),
+                ("片尾", script.outro_style, "感谢观看"),
+            )
+            for label, style, text in card_options:
+                if style == "none":
+                    continue
+                card_path = str(temp_dir / ("intro.mp4" if label == "片头" else "outro.mp4"))
+                success = FFmpegTool.create_title_card(
+                    text,
+                    duration=2.0,
+                    output_path=card_path,
+                    width=int(source_info["width"]),
+                    height=int(source_info["height"]),
+                    fade=style == "fade_black",
+                )
+                if not success:
+                    errors.append(f"{label}生成失败")
+                    return self._fail(errors, log_lines)
+                card_paths.append((label, card_path))
+                done += 1
+
+            if card_paths:
+                ordered_paths = [path for label, path in card_paths if label == "片头"]
+                ordered_paths += [merged_path]
+                ordered_paths += [path for label, path in card_paths if label == "片尾"]
+                decorated_path = str(temp_dir / "with_intro_outro.mp4")
+                if not FFmpegTool.concat_segments(ordered_paths, decorated_path):
+                    errors.append("片头片尾拼接失败")
+                    return self._fail(errors, log_lines)
+                decorated_source = decorated_path
+                done += 1
+
+            # ============================================
+            # 第四步：混入用户提供的背景音乐
+            # ============================================
+            render_source = decorated_source
+            if script.bgm_path:
+                self.log("Step 3: 混入背景音乐...")
+                log_lines.append(f"背景音乐: {Path(script.bgm_path).name}")
+                mixed_path = str(temp_dir / "with_bgm.mp4")
+                success = FFmpegTool.mix_background_music(
+                    decorated_source, script.bgm_path, mixed_path, script.bgm_volume
+                )
+                if success:
+                    render_source = mixed_path
+                    done += 1
+                else:
+                    errors.append("背景音乐混入失败，已保留原始人声版本")
+                    failed += 1
+
+            # ============================================
+            # 第五步：烧录字幕
             # ============================================
             if script.srt_subtitles:
                 self.log("Step 3: 烧录字幕...")
@@ -144,9 +209,10 @@ class ExecutorAgent(BaseAgent):
                 srt_path.write_text(script.srt_subtitles, encoding="utf-8")
 
                 success = FFmpegTool.burn_subtitles(
-                    merged_path,
+                    render_source,
                     str(srt_path),
                     output_path,
+                    style_name=script.subtitle_style,
                 )
 
                 if success:
@@ -156,26 +222,24 @@ class ExecutorAgent(BaseAgent):
                     self.log("字幕烧录失败，输出无字幕版本", level="warning")
                     errors.append("字幕烧录失败，已输出无字幕版本")
                     failed += 1
-                    shutil.copy2(merged_path, output_path)
+                    shutil.copy2(render_source, output_path)
             else:
                 # 没有字幕，直接复制
-                shutil.copy2(merged_path, output_path)
+                shutil.copy2(render_source, output_path)
 
             # ============================================
             # 第四步：验证输出
             # ============================================
-            output_file = Path(output_path)
-            if not output_file.exists():
-                errors.append("输出文件不存在！")
+            valid, validation_error, actual_duration = FFmpegTool.validate_output(
+                output_path, script.estimated_duration
+            )
+            if not valid:
+                errors.append(validation_error)
                 return self._fail(errors, log_lines)
-
+            output_file = Path(output_path)
             output_size_mb = output_file.stat().st_size / (1024 * 1024)
             self.log(f"输出文件: {output_path} ({output_size_mb:.1f}MB)")
             log_lines.append(f"输出文件大小: {output_size_mb:.1f}MB")
-
-            # 获取实际时长
-            info = FFmpegTool.get_video_info(output_path)
-            actual_duration = info.get("duration", script.estimated_duration) if info else script.estimated_duration
 
             self._end_timer()
 
@@ -202,7 +266,7 @@ class ExecutorAgent(BaseAgent):
             # 清理临时文件
             try:
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                self.log(f"已清理临时目录")
+                self.log("已清理临时目录")
             except Exception:
                 pass
 
@@ -229,7 +293,7 @@ if __name__ == "__main__":
 
     from pathlib import Path
 
-    test_video = Path("C:/Users/22307/video-agent-pipeline/data/test.mp4")
+    test_video = Path("data/test.mp4")
     if test_video.exists():
         # 创建一个简单的测试脚本
         from src.models.schemas import EditScript, EditOperation

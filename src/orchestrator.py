@@ -23,13 +23,18 @@ Python 知识点：
 
 import time
 import logging
+import json
+import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from src.agents.requirement_agent import RequirementAgent
 from src.agents.analysis_agent import AnalysisAgent
 from src.agents.script_agent import ScriptAgent
 from src.agents.executor_agent import ExecutorAgent
+from src.config import OUTPUT_DIR, WHISPER_MODEL_SIZE
+from src.tools.ffmpeg import FFmpegTool
 from src.models.schemas import (
     VideoRequirement,
     ContentAnalysis,
@@ -63,11 +68,13 @@ class VideoEditOrchestrator:
         # 创建 4 个 Agent 实例
         # 注意：Agent 2 加载 Whisper 模型需要一些时间
         self.agent1 = RequirementAgent()
-        self.agent2 = AnalysisAgent(whisper_model_size="large-v3")
+        self.agent2 = AnalysisAgent(whisper_model_size=WHISPER_MODEL_SIZE)
         self.agent3 = ScriptAgent()
         self.agent4 = ExecutorAgent()
 
         self.status = PipelineStatus(step="init")
+        self.task_dir: Path | None = None
+        self.preview_paths: dict[str, str] = {}
         logger.info("4 个 Agent 初始化完成，就绪")
 
     def run(
@@ -92,7 +99,6 @@ class VideoEditOrchestrator:
           Agent 3 (脚本生成) → Agent 4 (执行处理)
         """
         total_start = time.time()
-        self.status.started_at = datetime.now().isoformat()
 
         print("\n" + "=" * 60)
         print("  多 Agent 视频自动剪辑系统")
@@ -101,61 +107,16 @@ class VideoEditOrchestrator:
         print(f"  需求: {user_input[:50]}...")
         print("=" * 60 + "\n")
 
-        # ============================================
-        # Step 1: Agent 1 — 需求理解
-        # ============================================
-        self.status.step = "requirement"
-        logger.info(">>> Step 1/4: Agent 1 - 需求理解")
-
         try:
-            requirement = self.agent1.run(user_input)
-            self.status.requirement = requirement
-            self._print_requirement(requirement)
-        except Exception as e:
-            logger.error(f"Agent 1 失败: {e}")
-            return self._error_result(f"需求理解失败: {e}")
-
-        # ============================================
-        # Step 2: Agent 2 — 内容分析
-        # ============================================
-        self.status.step = "analysis"
-        logger.info(">>> Step 2/4: Agent 2 - 内容分析")
-
-        try:
-            analysis = self.agent2.run(video_path, requirement)
-            self.status.analysis = analysis
-            self._print_analysis(analysis)
-        except Exception as e:
-            logger.error(f"Agent 2 失败: {e}")
-            return self._error_result(f"内容分析失败: {e}")
-
-        # ============================================
-        # Step 3: Agent 3 — 剪辑脚本生成
-        # ============================================
-        self.status.step = "script"
-        logger.info(">>> Step 3/4: Agent 3 - 剪辑脚本生成")
-
-        try:
-            script = self.agent3.run(analysis, requirement)
-            self.status.script = script
+            script = self.prepare(video_path, user_input)
+            self._print_requirement(self.status.requirement)
+            self._print_analysis(self.status.analysis)
             self._print_script(script)
-        except Exception as e:
-            logger.error(f"Agent 3 失败: {e}")
-            return self._error_result(f"脚本生成失败: {e}")
-
-        # ============================================
-        # Step 4: Agent 4 — 执行处理
-        # ============================================
-        self.status.step = "execution"
-        logger.info(">>> Step 4/4: Agent 4 - 执行处理")
-
-        try:
-            result = self.agent4.run(script, video_path, output_path)
-            self.status.result = result
+            result = self.render(script, video_path, output_path)
             self._print_result(result, total_start)
         except Exception as e:
-            logger.error(f"Agent 4 失败: {e}")
-            return self._error_result(f"执行处理失败: {e}")
+            logger.error(f"流水线失败: {e}")
+            return self._error_result(str(e))
 
         # ============================================
         # 完成
@@ -163,6 +124,138 @@ class VideoEditOrchestrator:
         self.status.step = "done"
         self.status.completed_at = datetime.now().isoformat()
         return result
+
+    def prepare(
+        self,
+        video_path: str,
+        user_input: str,
+        overrides: Optional[dict] = None,
+        generate_previews: bool = False,
+    ) -> EditScript:
+        """生成可供用户确认的剪辑计划，不执行视频渲染。"""
+        self.status = PipelineStatus(step="created", started_at=datetime.now().isoformat())
+        self.task_dir = OUTPUT_DIR / "tasks" / uuid.uuid4().hex
+        self.task_dir.mkdir(parents=True, exist_ok=False)
+        self.preview_paths = {}
+        media_info = FFmpegTool.get_video_info(video_path)
+        if not media_info or not media_info.get("has_audio"):
+            self._write_manifest("failed", error="视频预检失败：需要可解码的视频和音频流")
+            raise ValueError("视频预检失败：需要可解码的视频和音频流")
+        self._write_json("media_info.json", media_info)
+        self._write_manifest("preflight_ok", video_path=str(Path(video_path).resolve()))
+        self.status.step = "requirement"
+        requirement = self.agent1.run(user_input)
+        if overrides:
+            updates = {
+                key: value
+                for key, value in overrides.items()
+                if value is not None and value != "" and value != []
+            }
+            requirement = VideoRequirement.model_validate({**requirement.model_dump(), **updates})
+        self._write_json("requirement.json", requirement.model_dump())
+        self._write_manifest("requirement_ready")
+        self.status.step = "analysis"
+        analysis = self.agent2.run(video_path, requirement)
+        self._write_json("analysis.json", analysis.model_dump())
+        self._write_manifest("analyzed")
+        self.status.step = "script"
+        script = self.agent3.run(analysis, requirement)
+        self.status.requirement = requirement
+        self.status.analysis = analysis
+        self.status.script = script
+        self.status.step = "awaiting_confirmation"
+        self._write_json("edit_plan.json", script.model_dump())
+        if generate_previews:
+            self.preview_paths = self._create_previews(video_path, script)
+        self._write_manifest("awaiting_confirmation")
+        return script
+
+    def render(self, script: EditScript, video_path: str, output_path: str = "") -> ExecutionResult:
+        """仅渲染已经确认的剪辑计划。"""
+        if not output_path and self.task_dir:
+            output_path = str(self.task_dir / "final.mp4")
+        if self.task_dir and script.srt_subtitles:
+            (self.task_dir / "subtitles.srt").write_text(script.srt_subtitles, encoding="utf-8")
+        result = self.agent4.run(script, video_path, output_path)
+        self.status.result = result
+        self.status.step = "done" if result.success else "error"
+        self.status.completed_at = datetime.now().isoformat()
+        if self.task_dir:
+            self._write_json("execution_result.json", result.model_dump())
+            (self.task_dir / "render.log").write_text(result.log, encoding="utf-8")
+            self._write_manifest("succeeded" if result.success else "failed", output_path=result.output_path)
+        return result
+
+    def confirm_and_render(
+        self,
+        script: EditScript,
+        selected_orders: list[int],
+        video_path: str,
+        output_path: str = "",
+        transition_duration: float = 0.0,
+        subtitle_style: str = "classic",
+        bgm_path: Optional[str] = None,
+        bgm_volume: float = 0.15,
+        intro_style: str = "none",
+        outro_style: str = "none",
+        title_text: str = "",
+    ) -> ExecutionResult:
+        """应用用户的片段选择后再渲染，防止未确认计划直接导出。"""
+        if self.status.analysis is None:
+            raise ValueError("没有可确认的分析结果，请先生成剪辑方案")
+        confirmed = self.agent3.apply_selection(
+            script,
+            self.status.analysis,
+            selected_orders,
+            transition_duration=transition_duration,
+            subtitle_style=subtitle_style,
+            bgm_path=bgm_path,
+            bgm_volume=bgm_volume,
+            intro_style=intro_style,
+            outro_style=outro_style,
+            title_text=title_text,
+        )
+        if not confirmed.operations:
+            raise ValueError("请至少保留一个片段")
+        self.status.script = confirmed
+        if self.task_dir:
+            self._write_json("confirmed_edit_plan.json", confirmed.model_dump())
+            self._write_manifest("rendering")
+        return self.render(confirmed, video_path, output_path)
+
+    def _create_previews(self, video_path: str, script: EditScript) -> dict[str, str]:
+        """生成候选片段预览；失败不影响主剪辑流程。"""
+        if not self.task_dir:
+            return {}
+        preview_dir = self.task_dir / "previews"
+        preview_dir.mkdir(exist_ok=True)
+        previews: dict[str, str] = {}
+        for operation in script.operations:
+            if operation.action != "cut" or operation.source_start is None or operation.source_end is None:
+                continue
+            preview_path = preview_dir / f"clip_{operation.order:02d}.mp4"
+            if FFmpegTool.create_preview(video_path, operation.source_start, operation.source_end, str(preview_path)):
+                previews[str(operation.order)] = str(preview_path.resolve())
+        return previews
+
+    def _write_json(self, filename: str, payload: dict) -> None:
+        if self.task_dir:
+            destination = self.task_dir / filename
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(destination)
+
+    def _write_manifest(self, state: str, **extra: str) -> None:
+        if self.task_dir:
+            self._write_json(
+                "manifest.json",
+                {
+                    "task_id": self.task_dir.name,
+                    "state": state,
+                    "updated_at": datetime.now().isoformat(),
+                    **extra,
+                },
+            )
 
     def run_interactive(self, video_path: str, user_input: str):
         """
@@ -181,7 +274,7 @@ class VideoEditOrchestrator:
     def _print_requirement(self, req: VideoRequirement):
         """打印需求理解结果"""
         print(f"\n{'='*40}")
-        print(f"  [Agent 1] 需求理解完成")
+        print("  [Agent 1] 需求理解完成")
         print(f"  类型: {req.video_type} | 风格: {req.style}")
         print(f"  目标时长: {req.target_duration//60}分{req.target_duration%60}秒")
         print(f"  关键词: {', '.join(req.focus_keywords)}")
@@ -190,13 +283,13 @@ class VideoEditOrchestrator:
     def _print_analysis(self, analysis: ContentAnalysis):
         """打印内容分析结果"""
         print(f"\n{'='*40}")
-        print(f"  [Agent 2] 内容分析完成")
+        print("  [Agent 2] 内容分析完成")
         print(f"  视频时长: {analysis.video_duration/60:.1f} 分钟")
         print(f"  转录片段: {len(analysis.transcript)} 个")
         print(f"  高光片段: {len(analysis.highlights)} 个")
         print(f"  摘要: {analysis.summary[:80]}...")
         if analysis.highlights:
-            print(f"  Top 3 高光:")
+            print("  Top 3 高光:")
             for i, h in enumerate(analysis.highlights[:3]):
                 print(f"    {i+1}. [{h.importance:.2f}] {h.start:.0f}s-{h.end:.0f}s | {h.reason[:30]}")
 
@@ -205,7 +298,7 @@ class VideoEditOrchestrator:
         cuts = [op for op in script.operations if op.action == "cut"]
         transitions = [op for op in script.operations if op.action == "transition"]
         print(f"\n{'='*40}")
-        print(f"  [Agent 3] 剪辑脚本生成完成")
+        print("  [Agent 3] 剪辑脚本生成完成")
         print(f"  标题: {script.title}")
         print(f"  操作: {len(script.operations)} 个 ({len(cuts)} 个裁剪, {len(transitions)} 个转场)")
         print(f"  预估时长: {script.estimated_duration:.0f} 秒")
@@ -217,14 +310,14 @@ class VideoEditOrchestrator:
         total_time = time.time() - total_start
         print(f"\n{'='*60}")
         if result.success:
-            print(f"  剪辑完成！")
+            print("  剪辑完成！")
             print(f"  成品: {result.output_path}")
             print(f"  时长: {result.output_duration:.0f} 秒")
             print(f"  总耗时: {total_time:.0f} 秒 ({total_time/60:.1f} 分钟)")
             if result.errors:
                 print(f"  警告: {len(result.errors)} 个非致命错误")
         else:
-            print(f"  剪辑失败！")
+            print("  剪辑失败！")
             for err in result.errors:
                 print(f"  错误: {err}")
         print(f"{'='*60}\n")
@@ -233,6 +326,8 @@ class VideoEditOrchestrator:
         """生成错误结果"""
         self.status.step = "error"
         self.status.error_message = message
+        if self.task_dir:
+            self._write_manifest("failed", error=message)
         return ExecutionResult(
             success=False,
             output_path="",

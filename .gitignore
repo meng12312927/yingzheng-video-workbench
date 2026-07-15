@@ -7,13 +7,17 @@ build/
 
 # 虚拟环境
 venv/
+.venv/
 
 # 敏感信息（API Key）
 .env
+.env.*
+!.env.example
 
 # 视频文件（太大，不提交到 git）
 data/*
 output/*
+!output/.gitkeep
 *.mp4
 *.avi
 *.mov
@@ -26,3 +30,7 @@ output/*
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# Runtime logs and test artefacts
+*.log
+.pytest_cache/

@@ -21,6 +21,11 @@ python-dotenv>=1.0.0
 
 # Web 界面
 gradio>=4.0.0
+# Gradio 4.x 仍依赖 huggingface_hub.HfFolder；1.x 已移除该接口。
+huggingface-hub<1.0
 
 # 进度条
 tqdm>=4.0.0
+
+# 测试
+pytest>=8.0.0

@@ -12,8 +12,8 @@ ffmpeg.py — FFmpeg 视频处理工具
 Python 知识点：
   1. subprocess.run() — 在 Python 里执行外部命令
      类似你在命令行敲 "ffmpeg -i video.mp4 ..."，但是用代码自动敲
-  2. Path 对象 — pathlib 提供的跨平台路径处理
-     Path("data") / "video.mp4" → Windows: data\video.mp4, Mac: data/video.mp4
+  2. Path 对象 — pathlib 提供的路径处理
+     Path("data") / "video.mp4" → data/video.mp4
   3. @staticmethod — 静态方法，不需要创建对象就能调用
      FFmpegTool.cut_segment(...) 而不是 FFmpegTool().cut_segment(...)
 
@@ -36,6 +36,7 @@ import json
 import re
 from pathlib import Path
 from typing import Optional
+from src.config import VIDEO_ENCODER
 
 
 class FFmpegTool:
@@ -54,9 +55,7 @@ class FFmpegTool:
         """
         找到 FFmpeg 的安装路径
 
-        为什么需要这个函数？
-        Windows 上 FFmpeg 安装后可能需要重启才能被系统找到。
-        这个函数会尝试多种方式定位 FFmpeg，确保能调用成功。
+        这个函数会优先从 PATH 和 Homebrew 的常用位置定位 FFmpeg。
         """
         # 方式1：用 shutil.which 在系统 PATH 里找
         ffmpeg_path = shutil.which("ffmpeg")
@@ -74,9 +73,8 @@ class FFmpegTool:
 
         # 方式3：搜索常见安装位置
         common_paths = [
-            Path("C:/Program Files/FFmpeg/bin/ffmpeg.exe"),     # Windows
-            Path("/opt/homebrew/bin/ffmpeg"),                    # Mac Homebrew
-            Path("/usr/local/bin/ffmpeg"),                       # Mac Intel / Linux
+            Path("/opt/homebrew/bin/ffmpeg"),  # Apple Silicon Homebrew
+            Path("/usr/local/bin/ffmpeg"),     # Intel Mac Homebrew
         ]
         for p in common_paths:
             if p.exists():
@@ -85,6 +83,15 @@ class FFmpegTool:
         # 方式4：都找不到就返回 "ffmpeg"，
         # 让 subprocess 报错，用户能看到明确的错误信息
         return "ffmpeg"
+
+    @staticmethod
+    def _video_encode_args() -> list[str]:
+        """返回适合 macOS 的视频编码参数。"""
+        if VIDEO_ENCODER == "h264_videotoolbox":
+            return ["-c:v", VIDEO_ENCODER, "-q:v", "65"]
+        if VIDEO_ENCODER == "libx264":
+            return ["-c:v", VIDEO_ENCODER, "-preset", "medium", "-crf", "20"]
+        return ["-c:v", VIDEO_ENCODER]
 
     @staticmethod
     def _run(cmd: list[str], description: str = "") -> bool:
@@ -115,12 +122,33 @@ class FFmpegTool:
                 print(f"[FFmpeg] 错误: {result.stderr[-500:]}")  # 只打印最后 500 字符
                 return False
         except FileNotFoundError:
-            print(f"[FFmpeg] 找不到 FFmpeg！请先安装 FFmpeg")
-            print(f"         下载地址: https://ffmpeg.org/download.html")
+            print("[FFmpeg] 找不到 FFmpeg！请先安装 FFmpeg")
+            print("         下载地址: https://ffmpeg.org/download.html")
             return False
         except subprocess.TimeoutExpired:
-            print(f"[FFmpeg] 超时！视频处理超过了 10 分钟")
+            print("[FFmpeg] 超时！视频处理超过了 10 分钟")
             return False
+
+    @staticmethod
+    def _run_with_encoder_fallback(cmd: list[str], description: str) -> bool:
+        """VideoToolbox 不可用时自动以 libx264 重试，保证 macOS 上可交付。"""
+        if FFmpegTool._run(cmd, description):
+            return True
+        if VIDEO_ENCODER != "h264_videotoolbox":
+            return False
+
+        fallback: list[str] = []
+        index = 0
+        while index < len(cmd):
+            if cmd[index:index + 2] == ["-c:v", "h264_videotoolbox"]:
+                fallback.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "20"])
+                index += 2
+            elif cmd[index:index + 2] == ["-q:v", "65"]:
+                index += 2
+            else:
+                fallback.append(cmd[index])
+                index += 1
+        return FFmpegTool._run(fallback, f"{description}（VideoToolbox 不可用，改用 libx264）")
 
     # ============================================================
     # 核心功能
@@ -141,10 +169,21 @@ class FFmpegTool:
             "size_mb": 45.2,      # 文件大小（MB）
         }
         """
-        ffmpeg = FFmpegTool._find_ffmpeg()
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            bundled_ffmpeg = Path(FFmpegTool._find_ffmpeg())
+            sibling_probe = bundled_ffmpeg.with_name("ffprobe")
+            if sibling_probe.exists():
+                ffprobe = str(sibling_probe)
+        if not ffprobe:
+            return FFmpegTool._get_video_info_with_ffmpeg(video_path)
         cmd = [
-            ffmpeg, "-i", str(video_path),
-            "-f", "null", "-",  # 不实际转码，只读取信息
+            ffprobe,
+            "-v", "error",
+            "-show_format",
+            "-show_streams",
+            "-of", "json",
+            str(video_path),
         ]
 
         try:
@@ -154,33 +193,20 @@ class FFmpegTool:
                 text=True,
                 timeout=30,
             )
-            # FFmpeg 把视频信息输出到 stderr（一个历史遗留的设计）
-            info_text = result.stderr
-
-            # 用正则表达式从输出中提取信息
-            info = {}
-
-            # 提取时长: Duration: 00:02:05.50
-            duration_match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", info_text)
-            if duration_match:
-                h, m, s = duration_match.groups()
-                info["duration"] = int(h) * 3600 + int(m) * 60 + float(s)
-
-            # 提取分辨率: 1920x1080
-            res_match = re.search(r"(\d{2,4})x(\d{2,4})", info_text)
-            if res_match:
-                info["width"] = int(res_match.group(1))
-                info["height"] = int(res_match.group(2))
-
-            # 提取帧率
-            fps_match = re.search(r"(\d+\.?\d*) fps", info_text)
-            if fps_match:
-                info["fps"] = float(fps_match.group(1))
-
-            # 提取编码器
-            codec_match = re.search(r"Video: (\w+)", info_text)
-            if codec_match:
-                info["codec"] = codec_match.group(1)
+            if result.returncode != 0:
+                return None
+            probe = json.loads(result.stdout)
+            video_stream = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+            audio_stream = next((s for s in probe.get("streams", []) if s.get("codec_type") == "audio"), None)
+            if not video_stream:
+                return None
+            info = {
+                "duration": float(probe.get("format", {}).get("duration", 0)),
+                "width": int(video_stream.get("width", 0)),
+                "height": int(video_stream.get("height", 0)),
+                "codec": video_stream.get("codec_name", ""),
+                "has_audio": audio_stream is not None,
+            }
 
             # 文件大小
             file_path = Path(video_path)
@@ -192,6 +218,46 @@ class FFmpegTool:
         except Exception as e:
             print(f"[FFmpeg] 获取视频信息失败: {e}")
             return None
+
+    @staticmethod
+    def _get_video_info_with_ffmpeg(video_path: str) -> Optional[dict]:
+        """没有独立 ffprobe 时，用随 Faster-Whisper 安装的 ffmpeg 做兼容预检。"""
+        try:
+            result = subprocess.run(
+                [FFmpegTool._find_ffmpeg(), "-hide_banner", "-i", str(video_path), "-f", "null", "-"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            text = result.stderr
+            duration_match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", text)
+            video_match = re.search(r"Video: ([^,]+).*?(\d{2,5})x(\d{2,5})", text)
+            if not duration_match or not video_match:
+                return None
+            hours, minutes, seconds = duration_match.groups()
+            return {
+                "duration": int(hours) * 3600 + int(minutes) * 60 + float(seconds),
+                "width": int(video_match.group(2)),
+                "height": int(video_match.group(3)),
+                "codec": video_match.group(1).strip(),
+                "has_audio": "Audio:" in text,
+            }
+        except Exception as error:
+            print(f"[FFmpeg] 兼容预检失败: {error}")
+            return None
+
+    @staticmethod
+    def validate_output(video_path: str, expected_duration: float) -> tuple[bool, str, float]:
+        """校验导出文件存在、含视频流且时长与计划基本一致。"""
+        path = Path(video_path)
+        info = FFmpegTool.get_video_info(video_path)
+        if not path.exists() or path.stat().st_size == 0 or not info:
+            return False, "输出文件不存在、为空或无法解析", 0.0
+        actual_duration = float(info.get("duration", 0))
+        tolerance = max(2.0, expected_duration * 0.02)
+        if abs(actual_duration - expected_duration) > tolerance:
+            return False, f"输出时长 {actual_duration:.1f}s 与计划 {expected_duration:.1f}s 不符", actual_duration
+        return True, "", actual_duration
 
     @staticmethod
     def cut_segment(
@@ -212,10 +278,10 @@ class FFmpegTool:
           re_encode: True=重新编码（慢但精确）, False=快速切割（可能不精确）
 
         FFmpeg 命令拆解：
-          ffmpeg -ss 10.5 -i input.mp4 -to 30.0 -c:v h264_nvenc -c:a copy output.mp4
+          ffmpeg -ss 10.5 -i input.mp4 -t 20.5 -c:v h264_videotoolbox -c:a aac output.mp4
                 │       │           │           │                     │
                 │       │           │           │                     └─ 输出
-                │       │           │           └─ 编码器（h264_nvenc=GPU硬件编码）
+                │       │           │           └─ 编码器（macOS 默认 h264_videotoolbox）
                 │       │           └─ 结束时间（也可以用 -t 20.5 表示持续时长）
                 │       └─ 输入文件
                 └─ 开始位置（放 -i 前面可以快速跳转）
@@ -231,25 +297,20 @@ class FFmpegTool:
         ]
 
         if re_encode:
-            # 用 GPU 硬件编码（快！）
-            cmd += [
-                "-c:v", "h264_nvenc",    # NVIDIA GPU 编码
-                "-preset", "p1",         # 最快预设
-                "-c:a", "aac",           # 音频用 AAC
-            ]
+            cmd += FFmpegTool._video_encode_args() + ["-c:a", "aac"]
         else:
             # 不重新编码，直接复制（超快，但切割位置可能偏移几帧）
             cmd += ["-c", "copy"]
 
         cmd += ["-y", str(output_path)]  # -y = 覆盖已存在的文件
 
-        return FFmpegTool._run(cmd, f"裁剪 {start_time:.1f}s - {end_time:.1f}s")
+        return FFmpegTool._run_with_encoder_fallback(cmd, f"裁剪 {start_time:.1f}s - {end_time:.1f}s")
 
     @staticmethod
     def concat_segments(
         segment_paths: list[str],
         output_path: str,
-        add_transition: bool = False,
+        transition_duration: float = 0.0,
     ) -> bool:
         """
         把多个视频片段拼接成一个完整视频
@@ -257,7 +318,7 @@ class FFmpegTool:
         参数：
           segment_paths: 片段路径列表（按顺序排列）
           output_path: 输出文件路径
-          add_transition: 是否在片段间加淡入淡出（实验性）
+          transition_duration: 相邻片段的淡转场时长；0 表示硬切
 
         拼接有两种方式：
           方式A：用 concat demuxer（需要先写一个文件列表）
@@ -274,6 +335,9 @@ class FFmpegTool:
 
         ffmpeg = FFmpegTool._find_ffmpeg()
 
+        if transition_duration > 0 and len(segment_paths) > 1:
+            return FFmpegTool._concat_with_fades(segment_paths, output_path, transition_duration)
+
         # Step 1: 创建一个临时文本文件，列出所有要拼接的片段
         concat_list_path = Path(output_path).parent / "_concat_list.txt"
         with open(concat_list_path, "w", encoding="utf-8") as f:
@@ -281,8 +345,7 @@ class FFmpegTool:
                 # concat 文件格式：
                 # file 'path/to/segment1.mp4'
                 # file 'path/to/segment2.mp4'
-                # 注意：路径中的反斜杠要替换成正斜杠
-                safe_path = str(Path(seg_path).resolve()).replace("\\", "/")
+                safe_path = str(Path(seg_path).resolve())
                 f.write(f"file '{safe_path}'\n")
 
         # Step 2: 用 FFmpeg concat demuxer 拼接
@@ -291,13 +354,12 @@ class FFmpegTool:
             "-f", "concat",              # concat 格式
             "-safe", "0",                # 允许绝对路径
             "-i", str(concat_list_path), # 片段列表文件
-            "-c:v", "h264_nvenc",        # GPU 编码
-            "-preset", "p1",
+            *FFmpegTool._video_encode_args(),
             "-c:a", "aac",
             "-y", str(output_path),
         ]
 
-        success = FFmpegTool._run(cmd, f"拼接 {len(segment_paths)} 个片段")
+        success = FFmpegTool._run_with_encoder_fallback(cmd, f"拼接 {len(segment_paths)} 个片段")
 
         # Step 3: 清理临时文件
         if concat_list_path.exists():
@@ -306,12 +368,118 @@ class FFmpegTool:
         return success
 
     @staticmethod
+    def _concat_with_fades(segment_paths: list[str], output_path: str, duration: float) -> bool:
+        """以 xfade/acrossfade 拼接，减少硬切造成的突兀感。"""
+        segment_infos = [FFmpegTool.get_video_info(path) for path in segment_paths]
+        if any(info is None for info in segment_infos):
+            return False
+        if any(float(info["duration"]) <= duration for info in segment_infos):
+            print("[FFmpeg] 片段太短，无法应用淡转场")
+            return False
+
+        ffmpeg = FFmpegTool._find_ffmpeg()
+        cmd = [ffmpeg]
+        for path in segment_paths:
+            cmd += ["-i", str(path)]
+
+        filters: list[str] = []
+        video_label = "0:v"
+        audio_label = "0:a"
+        timeline_duration = float(segment_infos[0]["duration"])
+        for index, info in enumerate(segment_infos[1:], start=1):
+            output_video = f"v{index}"
+            output_audio = f"a{index}"
+            offset = max(0.0, timeline_duration - duration)
+            filters.append(
+                f"[{video_label}][{index}:v]xfade=transition=fade:duration={duration}:offset={offset}[{output_video}]"
+            )
+            filters.append(f"[{audio_label}][{index}:a]acrossfade=d={duration}[{output_audio}]")
+            video_label = output_video
+            audio_label = output_audio
+            timeline_duration += float(info["duration"]) - duration
+
+        cmd += [
+            "-filter_complex", ";".join(filters),
+            "-map", f"[{video_label}]",
+            "-map", f"[{audio_label}]",
+            *FFmpegTool._video_encode_args(),
+            "-c:a", "aac",
+            "-y", str(output_path),
+        ]
+        return FFmpegTool._run_with_encoder_fallback(cmd, f"淡转场拼接 {len(segment_paths)} 个片段")
+
+    @staticmethod
+    def mix_background_music(video_path: str, music_path: str, output_path: str, volume: float = 0.15) -> bool:
+        """循环用户提供的 BGM，并以较低音量混入原始人声。"""
+        if not Path(music_path).exists():
+            print("[FFmpeg] 背景音乐文件不存在")
+            return False
+        ffmpeg = FFmpegTool._find_ffmpeg()
+        cmd = [
+            ffmpeg,
+            "-i", str(video_path),
+            "-stream_loop", "-1", "-i", str(music_path),
+            "-filter_complex", f"[1:a]volume={volume}[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[mix]",
+            "-map", "0:v:0",
+            "-map", "[mix]",
+            *FFmpegTool._video_encode_args(),
+            "-c:a", "aac",
+            "-shortest",
+            "-y", str(output_path),
+        ]
+        return FFmpegTool._run_with_encoder_fallback(cmd, "混入背景音乐")
+
+    @staticmethod
+    def create_preview(video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
+        """生成适合 UI 播放的低分辨率候选片段预览。"""
+        ffmpeg = FFmpegTool._find_ffmpeg()
+        cmd = [
+            ffmpeg, "-ss", str(start_time), "-i", str(video_path), "-t", str(end_time - start_time),
+            "-vf", "scale=-2:360", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-c:a", "aac", "-y", str(output_path),
+        ]
+        return FFmpegTool._run(cmd, f"生成预览 {start_time:.1f}s - {end_time:.1f}s")
+
+    @staticmethod
+    def create_title_card(
+        text: str,
+        duration: float,
+        output_path: str,
+        width: int,
+        height: int,
+        fade: bool = False,
+    ) -> bool:
+        """生成带静音音轨的黑底文字片头或片尾，确保可与主视频拼接。"""
+        ffmpeg = FFmpegTool._find_ffmpeg()
+        safe_text = text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        font_size = max(26, min(64, width // 18))
+        filter_parts = [
+            f"drawtext=fontcolor=white:fontsize={font_size}:text='{safe_text}':x=(w-text_w)/2:y=(h-text_h)/2"
+        ]
+        if fade:
+            fade_duration = min(0.45, duration / 3)
+            filter_parts.append(f"fade=t=in:st=0:d={fade_duration}")
+            filter_parts.append(f"fade=t=out:st={max(0, duration - fade_duration)}:d={fade_duration}")
+        cmd = [
+            ffmpeg,
+            "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d={duration}:r=30",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-vf", ",".join(filter_parts),
+            "-shortest",
+            *FFmpegTool._video_encode_args(),
+            "-c:a", "aac",
+            "-y", str(output_path),
+        ]
+        return FFmpegTool._run_with_encoder_fallback(cmd, "生成片头/片尾")
+
+    @staticmethod
     def burn_subtitles(
         video_path: str,
         subtitle_path: str,
         output_path: str,
         font_size: int = 18,
         font_color: str = "white",
+        style_name: str = "classic",
     ) -> bool:
         """
         把字幕文件烧录到视频上（硬字幕，永远显示）
@@ -327,16 +495,19 @@ class FFmpegTool:
           subtitles=subtitle.srt:force_style='FontSize=18'
           这个滤镜会读取 SRT 文件，按时间轴把文字画在视频上
 
-        注意：Windows 上需要确保字幕文件路径中的反斜杠正确处理
+        macOS 路径通常可直接使用；冒号需要为 FFmpeg filter 转义。
         """
         ffmpeg = FFmpegTool._find_ffmpeg()
 
-        # Windows 上 FFmpeg 字幕滤镜的路径处理：
-        # 反斜杠 \ 需要转义，正斜杠 / 可以直接用
-        safe_sub_path = str(Path(subtitle_path).resolve()).replace("\\", "\\\\").replace(":", "\\:")
+        safe_sub_path = str(Path(subtitle_path).resolve()).replace(":", "\\:")
 
-        # 构建字幕样式
-        style = f"FontSize={font_size},FontColor={font_color},Outline=1,OutlineColor=black"
+        # libass 样式。使用通用字体名，让 macOS 按中文字体回退。
+        styles = {
+            "classic": f"FontSize={font_size},FontColor={font_color},Outline=2,OutlineColor=black,Shadow=1,Alignment=2,MarginV=32",
+            "clean": "FontSize=20,FontColor=&H00FFFFFF,Outline=1,OutlineColor=&H66000000,Shadow=0,Alignment=2,MarginV=36",
+            "highlight": "FontSize=24,FontColor=&H0000FFFF,Outline=2,OutlineColor=&H00000000,Shadow=1,Bold=1,Alignment=2,MarginV=42",
+        }
+        style = styles.get(style_name, styles["classic"])
 
         # 字幕滤镜
         subtitle_filter = f"subtitles='{safe_sub_path}':force_style='{style}'"
@@ -345,13 +516,12 @@ class FFmpegTool:
             ffmpeg,
             "-i", str(video_path),
             "-vf", subtitle_filter,     # video filter = 视频滤镜
-            "-c:v", "h264_nvenc",
-            "-preset", "p1",
+            *FFmpegTool._video_encode_args(),
             "-c:a", "copy",             # 音频直接复制，不重编码
             "-y", str(output_path),
         ]
 
-        return FFmpegTool._run(cmd, "烧录字幕")
+        return FFmpegTool._run_with_encoder_fallback(cmd, "烧录字幕")
 
     @staticmethod
     def extract_audio(video_path: str, output_path: str, format: str = "wav") -> bool:
@@ -389,14 +559,13 @@ class FFmpegTool:
             "-f", "lavfi",
             "-i", f"color=c=black:s={width}x{height}:d={duration}:r=30",
             "-f", "lavfi",
-            "-i", f"anullsrc=r=44100:cl=mono",
+            "-i", "anullsrc=r=44100:cl=mono",
             "-shortest",
-            "-c:v", "h264_nvenc",
-            "-preset", "p1",
+            *FFmpegTool._video_encode_args(),
             "-y", str(output_path),
         ]
 
-        return FFmpegTool._run(cmd, f"生成 {duration}s 黑场")
+        return FFmpegTool._run_with_encoder_fallback(cmd, f"生成 {duration}s 黑场")
 
 
 # ============================================================
@@ -410,7 +579,7 @@ if __name__ == "__main__":
     tool = FFmpegTool()
 
     # 测试：找一个视频文件
-    test_dir = Path("C:/Users/22307/video-agent-pipeline/data")
+    test_dir = Path("data")
     videos = list(test_dir.glob("*.mp4")) + list(test_dir.glob("*.mov")) + list(test_dir.glob("*.avi"))
 
     if videos:
@@ -428,8 +597,8 @@ if __name__ == "__main__":
         tool.cut_segment(
             str(test_video),
             0, 5,
-            str(Path("C:/Users/22307/video-agent-pipeline/output/test_cut.mp4")),
+            str(Path("output/test_cut.mp4")),
         )
     else:
         print("请放一个测试视频到 data/ 文件夹，例如:")
-        print("  C:\\Users\\22307\\video-agent-pipeline\\data\\test.mp4")
+        print("  data/test.mp4")
