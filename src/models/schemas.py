@@ -28,8 +28,21 @@ Python 知识点：
 """
 
 from __future__ import annotations
-from pydantic import BaseModel, Field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Literal, Optional, Union
+from uuid import uuid4
+
+from pydantic import BaseModel, Field, model_validator
+
+
+def new_id(prefix: str) -> str:
+    """生成可读、可跨任务引用的领域对象 ID。"""
+    return f"{prefix}_{uuid4().hex}"
+
+
+def utc_now() -> datetime:
+    """统一使用带时区的 UTC 时间，便于审计记录排序。"""
+    return datetime.now(timezone.utc)
 
 
 # ============================================================
@@ -85,6 +98,269 @@ class VideoRequirement(BaseModel):
 
 
 # ============================================================
+# 映证领域层：需求、审核与审计
+# ============================================================
+
+class RequirementBrief(BaseModel):
+    """用户提交的原始业务需求；原文始终保留，不被模型输出覆盖。"""
+
+    id: str = Field(default_factory=lambda: new_id("brief"))
+    scenario: Literal["school", "enterprise"] = "school"
+    raw_text: str = Field(min_length=1)
+    submitted_by: Optional[str] = None
+    submitted_at: datetime = Field(default_factory=utc_now)
+
+
+class RequirementItem(BaseModel):
+    """一条可审核的业务要求，而不是仅供模型阅读的关键词。"""
+
+    id: str = Field(default_factory=lambda: new_id("req"))
+    category: str = Field(default="content")
+    description: str = Field(min_length=1)
+    priority: Literal["must", "should", "optional", "prohibited"] = "should"
+    status: Literal["draft", "confirmed", "needs_confirmation"] = "draft"
+    acceptance_rule: Optional[str] = None
+
+    @model_validator(mode="after")
+    def require_acceptance_rule_for_high_risk_items(self):
+        if self.priority in {"must", "prohibited"} and not self.acceptance_rule:
+            raise ValueError("must 和 prohibited 要求必须提供验收规则")
+        return self
+
+
+class RequirementSpec(BaseModel):
+    """可版本化的任务书；已确认版本不得原地修改。"""
+
+    id: str = Field(default_factory=lambda: new_id("requirement"))
+    version: int = Field(default=1, ge=1)
+    brief_id: str
+    purpose: str = Field(default="活动回顾视频")
+    audience: str = Field(default="活动参与者与相关负责人")
+    video_type: str = "general"
+    style: str = "formal"
+    need_subtitles: bool = True
+    need_bgm: bool = False
+    target_duration: float = Field(ge=1.0, le=3600.0)
+    duration_tolerance: float = Field(default=15.0, ge=0.0, le=300.0)
+    requirements: list[RequirementItem] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list, max_length=5)
+    status: Literal["draft", "confirmed", "superseded"] = "draft"
+    created_at: datetime = Field(default_factory=utc_now)
+    confirmed_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def confirmed_spec_cannot_have_open_questions(self):
+        if self.status == "confirmed" and self.open_questions:
+            raise ValueError("仍有待确认问题的任务书不能标记为 confirmed")
+        return self
+
+
+class ExecutionBrief(BaseModel):
+    """给用户看的 AI 执行说明，不包含内部提示词、安全规则或密钥。"""
+
+    id: str = Field(default_factory=lambda: new_id("execution"))
+    requirement_spec_id: str
+    requirement_spec_version: int = Field(ge=1)
+    version: int = Field(default=1, ge=1)
+    visible_instruction: str = Field(min_length=1)
+    included_requirement_ids: list[str] = Field(default_factory=list)
+    evidence_scope: list[str] = Field(default_factory=lambda: ["transcript", "user_annotation"])
+    model_task: Literal["candidate_analysis", "subtitle_review", "semantic_verification"] = "candidate_analysis"
+    prompt_template_version: str = "requirement-compiler-v1"
+    status: Literal["draft", "confirmed", "superseded"] = "draft"
+    confirmed_at: Optional[datetime] = None
+
+
+class RequirementCompilation(BaseModel):
+    """需求编译器产物：保留兼容执行视图，供旧剪辑流水线逐步迁移。"""
+
+    brief: RequirementBrief
+    spec: RequirementSpec
+    execution_brief: ExecutionBrief
+    legacy_requirement: VideoRequirement
+    mode: Literal["llm_generated", "manual_required"] = "llm_generated"
+    warnings: list[str] = Field(default_factory=list)
+    slots: list["RequirementSlot"] = Field(default_factory=list)
+
+
+SlotStatus = Literal["missing", "inferred", "confirmed", "conflict", "unknown"]
+
+
+class RequirementSlot(BaseModel):
+    """多轮需求澄清的最小槽位；每个值都保留来源与确认状态。"""
+
+    id: str = Field(default_factory=lambda: new_id("slot"))
+    key: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    value: Any = None
+    status: SlotStatus = "missing"
+    risk_level: Literal["low", "medium", "high"] = "low"
+    source_type: Literal["user_input", "form", "llm", "clarification", "domain_config"] = "llm"
+    source_ref: Optional[str] = None
+    question: Optional[str] = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ClarificationTurn(BaseModel):
+    """一轮可重放的需求澄清，只更新本轮涉及的槽位。"""
+
+    id: str = Field(default_factory=lambda: new_id("clarification"))
+    task_id: str
+    requirement_spec_id: str
+    from_version: int = Field(ge=1)
+    to_version: int = Field(ge=1)
+    answers: Dict[str, str] = Field(default_factory=dict)
+    changed_slot_ids: list[str] = Field(default_factory=list)
+    actor_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+TaskState = Literal[
+    "created", "preflight_ok", "requirement_draft",
+    "awaiting_requirement_clarification", "requirement_confirmed",
+    "style_recommended", "style_skipped", "analyzing", "awaiting_review",
+    "plan_approved", "rendering", "verifying",
+    "awaiting_delivery_resolution", "succeeded", "failed",
+]
+
+TaskEvent = Literal[
+    "preflight_passed", "requirement_drafted", "clarification_required",
+    "clarification_applied", "requirement_confirmed", "style_recommended",
+    "style_skipped", "analysis_started", "review_ready", "plan_approved",
+    "review_invalidated", "render_started", "render_completed",
+    "verification_passed", "delivery_resolution_required", "delivery_approved",
+    "delivery_revision_requested",
+    "task_failed",
+]
+
+
+class TaskSnapshot(BaseModel):
+    """可从磁盘恢复的任务状态快照；version 用于拒绝并发覆盖。"""
+
+    task_id: str
+    state: TaskState = "created"
+    version: int = Field(default=1, ge=1)
+    last_event_id: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class TaskEventRecord(BaseModel):
+    """幂等、带期望版本的状态事件。"""
+
+    id: str = Field(default_factory=lambda: new_id("task_event"))
+    task_id: str
+    event: TaskEvent
+    from_state: TaskState
+    to_state: TaskState
+    expected_state_version: int = Field(ge=1)
+    resulting_state_version: int = Field(ge=2)
+    idempotency_key: str = Field(min_length=1)
+    actor_id: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class StyleAsset(BaseModel):
+    """当前渲染器可稳定执行的单项视觉样式。"""
+
+    id: str
+    version: int = Field(default=1, ge=1)
+    category: Literal["intro", "outro", "subtitle", "transition"]
+    name: str
+    description: str
+    config: Dict[str, Any] = Field(default_factory=dict)
+    active: bool = True
+
+
+class StyleBundle(BaseModel):
+    """只引用受控 StyleAsset ID 的组合方案。"""
+
+    id: str
+    version: int = Field(default=1, ge=1)
+    name: str
+    scenario: Literal["common", "school", "enterprise"] = "common"
+    intro_style_id: str
+    outro_style_id: str
+    subtitle_style_id: str
+    transition_style_id: str
+
+
+class StyleProposal(BaseModel):
+    """LLM 只能推荐已有 bundle；选择仍由用户完成。"""
+
+    id: str = Field(default_factory=lambda: new_id("style_proposal"))
+    requirement_spec_id: str
+    requirement_spec_version: int = Field(ge=1)
+    bundle_id: str
+    rationale: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    source: Literal["llm", "deterministic_fallback"] = "llm"
+    status: Literal["suggested", "selected", "rejected"] = "suggested"
+
+
+class DeliverySpec(BaseModel):
+    """渲染和验收共同读取的版本化交付规则。"""
+
+    id: str = Field(default_factory=lambda: new_id("delivery_spec"))
+    version: int = Field(default=1, ge=1)
+    requirement_spec_id: str
+    requirement_spec_version: int = Field(ge=1)
+    target_duration: float = Field(gt=0.0)
+    duration_tolerance: float = Field(ge=0.0)
+    need_subtitles: bool = True
+    subtitle_style: Literal["classic", "clean", "highlight"] = "classic"
+    transition_duration: float = Field(default=0.0, ge=0.0, le=1.0)
+    intro_style: Literal["none", "title", "fade_black"] = "none"
+    outro_style: Literal["none", "title", "fade_black"] = "none"
+    title_text: str = ""
+    bgm_path: Optional[str] = None
+    bgm_volume: float = Field(default=0.15, ge=0.0, le=1.0)
+    style_bundle_id: Optional[str] = None
+    output_format: Literal["mp4"] = "mp4"
+
+
+ReviewStage = Literal[
+    "media_preflight", "requirement", "style", "evidence",
+    "candidate", "edit_plan", "render", "delivery",
+]
+ReviewStatus = Literal["pending", "approved", "changes_requested", "rejected", "superseded"]
+
+
+class ReviewGate(BaseModel):
+    """版本绑定的人工审核门禁；下游只能使用 approved 版本。"""
+
+    id: str = Field(default_factory=lambda: new_id("gate"))
+    task_id: str
+    stage: ReviewStage
+    target_type: str
+    target_id: str
+    target_version: int = Field(ge=1)
+    status: ReviewStatus = "pending"
+    actor_id: Optional[str] = None
+    comment: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+    resolved_at: Optional[datetime] = None
+
+
+class AuditEvent(BaseModel):
+    """面向业务用户的追加式审计事件；技术日志不写入这里。"""
+
+    id: str = Field(default_factory=lambda: new_id("audit"))
+    task_id: str
+    action: str
+    subject_type: str
+    subject_id: str
+    subject_version: Optional[int] = Field(default=None, ge=1)
+    actor_type: Literal["system", "user"] = "system"
+    actor_id: Optional[str] = None
+    summary: str
+    metadata: Dict[str, Optional[Union[str, int, float, bool]]] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+# ============================================================
 # Agent 2 内部 / Agent 2 → Agent 3：内容分析结果
 # ============================================================
 
@@ -94,10 +370,61 @@ class TranscriptSegment(BaseModel):
 
     Whisper 输出的一小段文字，包含起止时间。
     """
+    id: str = Field(default_factory=lambda: new_id("transcript"))
     start: float = Field(description="开始时间（秒）")
     end: float = Field(description="结束时间（秒）")
     text: str = Field(description="转录文本")
     speaker_id: int = Field(default=0, description="说话人编号（0-based）")
+
+
+class Evidence(BaseModel):
+    """可供模型引用、并由代码验证的不可变证据片段。"""
+
+    id: str = Field(default_factory=lambda: new_id("evidence"))
+    type: Literal["transcript", "ocr", "scene", "audio", "user_annotation"] = "transcript"
+    source_start: float = Field(ge=0.0)
+    source_end: float = Field(gt=0.0)
+    content: str = Field(min_length=1)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    segment_ids: list[str] = Field(default_factory=list)
+    content_hash: str = ""
+    metadata: Dict[str, Optional[Union[str, int, float, bool]]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def end_must_follow_start(self):
+        if self.source_end <= self.source_start:
+            raise ValueError("Evidence 的 source_end 必须大于 source_start")
+        return self
+
+
+class EvidenceCitation(BaseModel):
+    """候选片段对一项需求的可核验引用。"""
+
+    requirement_id: str = Field(min_length=1)
+    evidence_id: str = Field(min_length=1)
+    quote: str = Field(min_length=1)
+    relation: Literal["direct", "supporting"] = "direct"
+    retrieval_score: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class CandidateClip(BaseModel):
+    """证据化候选；模型建议不会因缺少有效引用进入自动选段。"""
+
+    id: str = Field(default_factory=lambda: new_id("candidate"))
+    source_start: float = Field(ge=0.0)
+    source_end: float = Field(gt=0.0)
+    matched_requirement_ids: list[str] = Field(default_factory=list)
+    citations: list[EvidenceCitation] = Field(default_factory=list)
+    selection_reason: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    suggested_duration: float = Field(gt=0.0)
+    risk_flags: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def candidate_end_must_follow_start(self):
+        if self.source_end <= self.source_start:
+            raise ValueError("CandidateClip 的 source_end 必须大于 source_start")
+        return self
 
 
 class HighlightClip(BaseModel):
@@ -124,6 +451,9 @@ class HighlightClip(BaseModel):
         default=None,
         description="剪辑建议，如'建议慢放'"
     )
+    candidate_id: Optional[str] = None
+    matched_requirement_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 class ContentAnalysis(BaseModel):
@@ -136,6 +466,14 @@ class ContentAnalysis(BaseModel):
     transcript: list[TranscriptSegment] = Field(
         default_factory=list,
         description="完整转录文本"
+    )
+    evidence: list[Evidence] = Field(
+        default_factory=list,
+        description="由转录或人工标注生成、可供后续候选引用的证据",
+    )
+    candidate_clips: list[CandidateClip] = Field(
+        default_factory=list,
+        description="证据校验后的候选；迁移期 highlights 仍保留给旧渲染器",
     )
     highlights: list[HighlightClip] = Field(
         default_factory=list,
@@ -254,6 +592,67 @@ class EditScript(BaseModel):
     )
 
 
+class TimelineSegment(BaseModel):
+    """审核视图中的逐段时间线，可追溯到候选、需求和证据。"""
+
+    id: str = Field(default_factory=lambda: new_id("timeline"))
+    order: int = Field(ge=1)
+    candidate_id: str
+    source_start: float = Field(ge=0.0)
+    source_end: float = Field(gt=0.0)
+    output_start: float = Field(ge=0.0)
+    output_end: float = Field(gt=0.0)
+    matched_requirement_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    title_text: Optional[str] = None
+    subtitle_text: Optional[str] = None
+    transition_style: Literal["cut", "fade"] = "cut"
+    transition_duration: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_timeline_ranges(self):
+        if self.source_end <= self.source_start:
+            raise ValueError("TimelineSegment 源时间范围非法")
+        if self.output_end <= self.output_start:
+            raise ValueError("TimelineSegment 成片时间范围非法")
+        return self
+
+
+class AuditableEditPlan(BaseModel):
+    """用户审核的事实来源；EditScript 只是批准计划的执行视图。"""
+
+    id: str = Field(default_factory=lambda: new_id("edit_plan"))
+    version: int = Field(default=1, ge=1)
+    requirement_spec_id: str
+    requirement_spec_version: int = Field(ge=1)
+    delivery_spec: DeliverySpec
+    timeline_segments: list[TimelineSegment] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
+    execution_script: EditScript
+    estimated_duration: float = Field(ge=0.0)
+    status: Literal["draft", "approved", "superseded"] = "draft"
+    created_at: datetime = Field(default_factory=utc_now)
+    approved_at: Optional[datetime] = None
+
+
+class CandidateDecision(BaseModel):
+    """用户对候选或文字的显式决定，用于重放审核结果和计算修改率。"""
+
+    id: str = Field(default_factory=lambda: new_id("decision"))
+    task_id: str
+    plan_id: str
+    plan_version: int = Field(ge=1)
+    candidate_id: str
+    action: Literal[
+        "keep", "delete", "trim", "replace", "reorder",
+        "subtitle_edit", "title_edit", "manual_add",
+    ]
+    before: Dict[str, Any] = Field(default_factory=dict)
+    after: Dict[str, Any] = Field(default_factory=dict)
+    actor_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 # ============================================================
 # Agent 4 → 外部：执行结果
 # ============================================================
@@ -277,6 +676,55 @@ class ExecutionResult(BaseModel):
     )
 
 
+class VerificationResult(BaseModel):
+    """单条任务要求的验收结论；确定性失败不能被语义建议覆盖。"""
+
+    requirement_id: str
+    status: Literal["passed", "failed", "warning", "manual_review"]
+    method: Literal["deterministic", "semantic", "human"]
+    summary: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    code: Optional[str] = None
+
+
+class DeliveryReport(BaseModel):
+    """绑定当前需求、计划和输出版本的逐项交付报告。"""
+
+    id: str = Field(default_factory=lambda: new_id("delivery_report"))
+    task_id: str
+    output_path: str
+    requirement_spec_id: str
+    requirement_spec_version: int = Field(ge=1)
+    edit_plan_id: str
+    edit_plan_version: int = Field(ge=1)
+    results: list[VerificationResult] = Field(default_factory=list)
+    status: Literal["passed", "needs_resolution", "approved_with_exceptions"]
+    approved_by: Optional[str] = None
+    exception_reason: Optional[str] = None
+    generated_at: datetime = Field(default_factory=utc_now)
+
+
+class ModelCallRecord(BaseModel):
+    """不含隐藏推理和密钥的模型/工具可观测记录。"""
+
+    id: str = Field(default_factory=lambda: new_id("model_call"))
+    task_id: Optional[str] = None
+    trace_id: str = Field(default_factory=lambda: new_id("trace"))
+    stage: str
+    provider: str
+    model: str
+    prompt_template_version: str
+    input_spec_id: Optional[str] = None
+    input_spec_version: Optional[int] = Field(default=None, ge=1)
+    duration_ms: int = Field(ge=0)
+    input_tokens: Optional[int] = Field(default=None, ge=0)
+    output_tokens: Optional[int] = Field(default=None, ge=0)
+    tool_names: list[str] = Field(default_factory=list)
+    error_code: Optional[str] = None
+    fallback_used: bool = False
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 # ============================================================
 # 管道状态（Orchestrator 用）
 # ============================================================
@@ -290,9 +738,17 @@ class PipelineStatus(BaseModel):
     """
     step: str = Field(description="当前步骤：init/requirement/analysis/script/execution/done/error")
     requirement: Optional[VideoRequirement] = None
+    requirement_spec: Optional[RequirementSpec] = None
+    execution_brief: Optional[ExecutionBrief] = None
+    requirement_gate: Optional[ReviewGate] = None
+    task_snapshot: Optional[TaskSnapshot] = None
+    style_proposals: list[StyleProposal] = Field(default_factory=list)
     analysis: Optional[ContentAnalysis] = None
     script: Optional[EditScript] = None
+    edit_plan: Optional[AuditableEditPlan] = None
+    plan_gate: Optional[ReviewGate] = None
     result: Optional[ExecutionResult] = None
+    delivery_report: Optional[DeliveryReport] = None
     error_message: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None

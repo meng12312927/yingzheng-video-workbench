@@ -21,27 +21,52 @@ Python 知识点：
 ===========================================================================
 """
 
+from __future__ import annotations
+
 import time
 import logging
 import json
+import re
 import uuid
+import hashlib
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from src.agents.requirement_agent import RequirementAgent
 from src.agents.analysis_agent import AnalysisAgent
+from src.agents.candidate_agent import CandidateAgent
+from src.agents.style_agent import StyleRecommendationAgent
 from src.agents.script_agent import ScriptAgent
 from src.agents.executor_agent import ExecutorAgent
 from src.config import OUTPUT_DIR, WHISPER_MODEL_SIZE
 from src.tools.ffmpeg import FFmpegTool
+from src.tools.llm import model_call_context
 from src.models.schemas import (
     VideoRequirement,
+    AuditableEditPlan,
+    AuditEvent,
     ContentAnalysis,
     EditScript,
+    Evidence,
+    ExecutionBrief,
     ExecutionResult,
     PipelineStatus,
+    RequirementBrief,
+    RequirementCompilation,
+    RequirementItem,
+    RequirementSpec,
+    RequirementSlot,
+    HighlightClip,
+    DeliveryReport,
 )
+from src.services.plans import EditPlanService
+from src.services.rendering import FFmpegRenderBackend
+from src.services.requirements import RequirementClarificationService
+from src.services.state_machine import TaskStateMachine
+from src.services.task_store import TaskStore
+from src.services.verification import VerificationEngine
 
 logger = logging.getLogger("Orchestrator")
 
@@ -65,17 +90,127 @@ class VideoEditOrchestrator:
         logger.info("初始化 VideoEditOrchestrator")
         logger.info("=" * 50)
 
-        # 创建 4 个 Agent 实例
-        # 注意：Agent 2 加载 Whisper 模型需要一些时间
+        # 创建领域组件；内容分析与候选判断明确分离。
         self.agent1 = RequirementAgent()
         self.agent2 = AnalysisAgent(whisper_model_size=WHISPER_MODEL_SIZE)
+        self.candidate_agent = CandidateAgent()
+        self.style_agent = StyleRecommendationAgent()
         self.agent3 = ScriptAgent()
         self.agent4 = ExecutorAgent()
+        self.plan_service = EditPlanService()
+        self.clarification_service = RequirementClarificationService()
+        self.verification_engine = VerificationEngine()
+        self.render_backend = FFmpegRenderBackend(self.agent4)
 
         self.status = PipelineStatus(step="init")
         self.task_dir: Path | None = None
+        self.store: TaskStore | None = None
+        self.state_machine: TaskStateMachine | None = None
         self.preview_paths: dict[str, str] = {}
-        logger.info("4 个 Agent 初始化完成，就绪")
+        self.video_path: str | None = None
+        self._render_lock = threading.Lock()
+        logger.info("需求、转录、证据候选、规划与执行组件初始化完成")
+
+    @classmethod
+    def open_task(
+        cls,
+        task_id: str,
+        runtime: Optional["VideoEditOrchestrator"] = None,
+    ) -> "VideoEditOrchestrator":
+        """从版本化磁盘产物恢复任务；不依赖 UI 进程内全局状态。"""
+        tasks_root = (OUTPUT_DIR / "tasks").resolve()
+        task_dir = (tasks_root / task_id).resolve()
+        if task_dir.parent != tasks_root or not task_dir.is_dir():
+            raise ValueError("任务不存在或 task_id 非法")
+        if runtime is None:
+            orchestrator = cls()
+        else:
+            orchestrator = cls.__new__(cls)
+            for name in (
+                "agent1", "agent2", "candidate_agent", "style_agent", "agent3", "agent4",
+                "plan_service", "clarification_service", "verification_engine", "render_backend",
+            ):
+                setattr(orchestrator, name, getattr(runtime, name))
+        orchestrator.task_dir = task_dir
+        orchestrator.store = TaskStore(task_dir)
+        orchestrator.state_machine = TaskStateMachine(task_dir)
+        snapshot = orchestrator.state_machine.load()
+        orchestrator.status = PipelineStatus(step=snapshot.state, task_snapshot=snapshot)
+        orchestrator.preview_paths = {
+            path.stem.split("_")[-1].lstrip("0") or "0": str(path.resolve())
+            for path in (task_dir / "previews").glob("clip_*.mp4")
+        } if (task_dir / "previews").exists() else {}
+        manifest_path = task_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        orchestrator.video_path = manifest.get("video_path")
+        orchestrator._render_lock = threading.Lock()
+
+        def latest(prefix: str, suffix: str = ".json") -> Optional[Path]:
+            matches = list(task_dir.glob(f"{prefix}_v*{suffix}"))
+            if not matches:
+                return None
+            def version(path: Path) -> int:
+                match = re.search(r"_v(\d+)\.json$", path.name)
+                return int(match.group(1)) if match else -1
+            return max(matches, key=version)
+
+        requirement_path = latest("requirement_spec")
+        execution_path = latest("execution_brief")
+        legacy_path = latest("legacy_requirement")
+        plan_path = latest("edit_plan")
+        if requirement_path:
+            orchestrator.status.requirement_spec = orchestrator.store.read_model(
+                requirement_path.name, RequirementSpec
+            )
+        if execution_path:
+            orchestrator.status.execution_brief = orchestrator.store.read_model(
+                execution_path.name, ExecutionBrief
+            )
+        if legacy_path:
+            orchestrator.status.requirement = orchestrator.store.read_model(
+                legacy_path.name, VideoRequirement
+            )
+        gates = orchestrator.store.load_gates()
+        orchestrator.status.requirement_gate = next(
+            (gate for gate in reversed(gates) if gate.stage == "requirement"), None
+        )
+        if (task_dir / "analysis.json").exists():
+            orchestrator.status.analysis = orchestrator.store.read_model(
+                "analysis.json", ContentAnalysis
+            )
+        if plan_path:
+            orchestrator.status.edit_plan = orchestrator.store.read_model(
+                plan_path.name, AuditableEditPlan
+            )
+            orchestrator.status.script = orchestrator.status.edit_plan.execution_script
+            orchestrator.status.plan_gate = next(
+                (
+                    gate for gate in reversed(gates)
+                    if gate.stage == "edit_plan"
+                    and gate.target_id == orchestrator.status.edit_plan.id
+                    and gate.target_version == orchestrator.status.edit_plan.version
+                ),
+                None,
+            )
+        style_path = latest("style_proposals")
+        if style_path:
+            from src.models.schemas import StyleProposal
+            payload = json.loads(style_path.read_text(encoding="utf-8"))
+            orchestrator.status.style_proposals = [
+                StyleProposal.model_validate(item) for item in payload.get("proposals", [])
+            ]
+        if (task_dir / "execution_result.json").exists():
+            orchestrator.status.result = orchestrator.store.read_model(
+                "execution_result.json", ExecutionResult
+            )
+        if (
+            snapshot.state in {"awaiting_delivery_resolution", "succeeded"}
+            and (task_dir / "delivery_report.json").exists()
+        ):
+            orchestrator.status.delivery_report = orchestrator.store.read_model(
+                "delivery_report.json", DeliveryReport
+            )
+        return orchestrator
 
     def run(
         self,
@@ -107,23 +242,9 @@ class VideoEditOrchestrator:
         print(f"  需求: {user_input[:50]}...")
         print("=" * 60 + "\n")
 
-        try:
-            script = self.prepare(video_path, user_input)
-            self._print_requirement(self.status.requirement)
-            self._print_analysis(self.status.analysis)
-            self._print_script(script)
-            result = self.render(script, video_path, output_path)
-            self._print_result(result, total_start)
-        except Exception as e:
-            logger.error(f"流水线失败: {e}")
-            return self._error_result(str(e))
-
-        # ============================================
-        # 完成
-        # ============================================
-        self.status.step = "done"
-        self.status.completed_at = datetime.now().isoformat()
-        return result
+        message = "全自动 run() 已停用：请先创建并确认需求任务书，再分析、审核候选和导出。"
+        logger.warning(message)
+        return self._error_result(message)
 
     def prepare(
         self,
@@ -132,59 +253,849 @@ class VideoEditOrchestrator:
         overrides: Optional[dict] = None,
         generate_previews: bool = False,
     ) -> EditScript:
-        """生成可供用户确认的剪辑计划，不执行视频渲染。"""
+        """已停用的旧接口，防止调用方绕过需求批准门禁。"""
+        raise RuntimeError(
+            "prepare() 已停用；请使用 create_requirement_draft()、"
+            "confirm_requirement_draft() 和 analyze_confirmed_requirement()"
+        )
+
+    def create_requirement_draft(
+        self,
+        video_path: str,
+        user_input: str,
+        scenario: str = "school",
+        overrides: Optional[dict] = None,
+        submitted_by: Optional[str] = None,
+    ) -> RequirementCompilation:
+        """创建可编辑任务书；本方法不调用转录或候选分析。"""
         self.status = PipelineStatus(step="created", started_at=datetime.now().isoformat())
         self.task_dir = OUTPUT_DIR / "tasks" / uuid.uuid4().hex
         self.task_dir.mkdir(parents=True, exist_ok=False)
+        self.store = TaskStore(self.task_dir)
+        self.state_machine = TaskStateMachine(self.task_dir)
+        self.status.task_snapshot = self.state_machine.initialise()
         self.preview_paths = {}
+        self.video_path = str(Path(video_path).resolve())
         media_info = FFmpegTool.get_video_info(video_path)
         if not media_info or not media_info.get("has_audio"):
+            self._transition(
+                "task_failed",
+                "preflight-failed",
+                payload={
+                    "error_code": "media_preflight_failed",
+                    "error_message": "需要可解码的视频和音频流",
+                },
+            )
             self._write_manifest("failed", error="视频预检失败：需要可解码的视频和音频流")
             raise ValueError("视频预检失败：需要可解码的视频和音频流")
         self._write_json("media_info.json", media_info)
+        self._transition("preflight_passed", "preflight-passed")
         self._write_manifest("preflight_ok", video_path=str(Path(video_path).resolve()))
-        self.status.step = "requirement"
-        requirement = self.agent1.run(user_input)
-        if overrides:
-            updates = {
-                key: value
-                for key, value in overrides.items()
-                if value is not None and value != "" and value != []
-            }
-            requirement = VideoRequirement.model_validate({**requirement.model_dump(), **updates})
-        self._write_json("requirement.json", requirement.model_dump())
-        self._write_manifest("requirement_ready")
-        self.status.step = "analysis"
-        analysis = self.agent2.run(video_path, requirement)
-        self._write_json("analysis.json", analysis.model_dump())
-        self._write_manifest("analyzed")
-        self.status.step = "script"
-        script = self.agent3.run(analysis, requirement)
+
+        try:
+            with model_call_context(
+                self.task_dir,
+                stage="requirement_compilation",
+                prompt_template_version="requirement-compiler-v1",
+            ):
+                compilation = self.agent1.compile(
+                    user_input,
+                    scenario=scenario,
+                    submitted_by=submitted_by,
+                    overrides=overrides,
+                )
+        except Exception as error:
+            self._fail_task("requirement_compilation_failed", error)
+            raise
+        gate = self.store.save_requirement_draft(
+            compilation.brief,
+            compilation.spec,
+            compilation.execution_brief,
+            actor_id=submitted_by,
+            generation_mode=compilation.mode,
+            slots=compilation.slots,
+        )
+        self.store.write_model(f"legacy_requirement_v{compilation.spec.version}.json", compilation.legacy_requirement)
+        self.status.requirement = compilation.legacy_requirement
+        self.status.requirement_spec = compilation.spec
+        self.status.execution_brief = compilation.execution_brief
+        self.status.requirement_gate = gate
+        self._transition("requirement_drafted", "requirement-drafted-v1")
+        needs_clarification = bool(
+            compilation.spec.open_questions
+            or any(item.status == "needs_confirmation" for item in compilation.spec.requirements)
+        )
+        if needs_clarification:
+            self._transition("clarification_required", "clarification-required-v1")
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest(
+            self.status.step,
+            requirement_version=str(compilation.spec.version),
+            requirement_compilation_mode=compilation.mode,
+        )
+        return compilation
+
+    def confirm_requirement_draft(
+        self,
+        gate_id: str,
+        actor_id: Optional[str] = None,
+        clarification_answers: str | dict[str, str] = "",
+        allow_confirmed_override: bool = False,
+    ) -> RequirementSpec:
+        """确认任务书后才允许后续转录和候选分析。"""
+        if not self.store or not self.state_machine:
+            raise ValueError("没有可确认的需求任务书，请先创建任务")
+        spec = self.status.requirement_spec
+        execution = self.status.execution_brief
+        if not spec or not execution:
+            raise ValueError("缺少当前需求任务书或执行说明")
+        if self.status.task_snapshot and self.status.task_snapshot.state == "awaiting_requirement_clarification":
+            if not clarification_answers:
+                raise ValueError("任务书仍有待确认问题，请填写补充说明后再确认")
+            slots = self.store.read_requirement_slots(spec.version)
+            if isinstance(clarification_answers, dict):
+                answer_map = clarification_answers
+            else:
+                text = clarification_answers.strip()
+                unresolved = [
+                    slot for slot in slots if slot.status in {"missing", "unknown"}
+                ]
+                answer_map = {
+                    slot.key: (
+                        text if slot.key in {"focus_keywords", "high_risk_review"} else "不知道"
+                    )
+                    for slot in unresolved
+                }
+            clarification_service = getattr(self, "clarification_service", None) or RequirementClarificationService()
+            revised_spec, revised_execution, revised_slots, turn = clarification_service.apply(
+                task_id=self.store.task_id,
+                spec=spec,
+                execution=execution,
+                slots=slots,
+                answers=answer_map,
+                actor_id=actor_id,
+                allow_confirmed_override=allow_confirmed_override,
+            )
+            revised_execution = revised_execution.model_copy(update={
+                "visible_instruction": RequirementAgent._build_visible_instruction(revised_spec)
+            })
+            brief = self.store.read_model("requirement_brief.json", RequirementBrief)
+            gate = self.store.save_requirement_revision(
+                brief,
+                spec,
+                revised_spec,
+                revised_execution,
+                actor_id,
+                slots=revised_slots,
+            )
+            self.store.append_clarification(turn)
+            previous_legacy = self.store.read_model(
+                f"legacy_requirement_v{spec.version}.json", VideoRequirement
+            )
+            revised_legacy = previous_legacy.model_copy(
+                update={
+                    "target_duration": int(revised_spec.target_duration),
+                    "style": revised_spec.style,
+                    "need_subtitles": revised_spec.need_subtitles,
+                    "need_bgm": revised_spec.need_bgm,
+                    "focus_keywords": [
+                        item.description for item in revised_spec.requirements
+                        if item.category == "content"
+                    ][:8],
+                }
+            )
+            self.store.write_model(
+                f"legacy_requirement_v{revised_spec.version}.json", revised_legacy
+            )
+            self._transition(
+                "clarification_applied",
+                f"clarification-applied-v{revised_spec.version}",
+                actor_id=actor_id,
+            )
+            spec, execution, gate_id = revised_spec, revised_execution, gate.id
+            self.status.requirement_spec = spec
+            self.status.execution_brief = execution
+            self.status.requirement_gate = gate
+            if spec.open_questions:
+                self._transition(
+                    "clarification_required",
+                    f"clarification-required-v{spec.version}",
+                    actor_id=actor_id,
+                )
+                raise ValueError("仍有未解决或冲突的需求槽位，请继续补充")
+
+        if spec.open_questions:
+            raise ValueError("请先解决任务书中的待确认问题")
+        if any(item.status == "needs_confirmation" for item in spec.requirements):
+            spec = spec.model_copy(
+                update={
+                    "requirements": [
+                        item.model_copy(update={"status": "confirmed"})
+                        if item.status == "needs_confirmation" else item
+                        for item in spec.requirements
+                    ]
+                }
+            )
+            self.store.write_model(f"requirement_spec_v{spec.version}.json", spec)
+        spec, execution, gate = self.store.confirm_requirement(gate_id, actor_id)
+        self.status.requirement_spec = spec
+        self.status.execution_brief = execution
+        self.status.requirement_gate = gate
+        self._transition(
+            "requirement_confirmed",
+            f"requirement-confirmed-v{spec.version}",
+            actor_id=actor_id,
+        )
+        proposals = []
+        style_agent = getattr(self, "style_agent", None)
+        if style_agent:
+            brief = self.store.read_model("requirement_brief.json", RequirementBrief)
+            with model_call_context(
+                self.task_dir,
+                stage="style_recommendation",
+                prompt_template_version="style-recommender-v1",
+                input_spec_id=spec.id,
+                input_spec_version=spec.version,
+            ):
+                proposals = style_agent.run(spec, brief.scenario)
+        self.status.style_proposals = proposals
+        if proposals:
+            self.store.write_payload(
+                f"style_proposals_v{spec.version}.json",
+                {"proposals": [item.model_dump(mode="json") for item in proposals]},
+            )
+            self.store.append_audit(
+                AuditEvent(
+                    task_id=self.store.task_id,
+                    action="style_recommended",
+                    subject_type="RequirementSpec",
+                    subject_id=spec.id,
+                    subject_version=spec.version,
+                    summary=f"系统从受控样式库推荐了 {len(proposals)} 组方案。",
+                )
+            )
+            self._transition("style_recommended", f"style-recommended-v{spec.version}")
+        else:
+            self._transition("style_skipped", f"style-skipped-v{spec.version}")
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest(self.status.step, requirement_version=str(spec.version))
+        return spec
+
+    def revise_requirement_draft(
+        self,
+        *,
+        updates: Optional[dict] = None,
+        requirements: Optional[list[dict]] = None,
+        actor_id: Optional[str] = None,
+        clear_open_questions: bool = False,
+    ) -> RequirementSpec:
+        """把用户在审核页的修改保存为新版本，不原地覆盖 AI 草稿。"""
+        if not self.store or not self.state_machine:
+            raise ValueError("没有可修改的需求任务书")
+        spec = self.status.requirement_spec
+        execution = self.status.execution_brief
+        gate = self.status.requirement_gate
+        if not spec or not execution or not gate:
+            raise ValueError("缺少当前需求任务书、执行说明或 Gate")
+        state = self.status.task_snapshot.state if self.status.task_snapshot else ""
+        if state not in {"requirement_draft", "awaiting_requirement_clarification"}:
+            raise ValueError(f"当前状态 {state} 不能修改需求任务书")
+
+        allowed_fields = {
+            "purpose", "audience", "video_type", "style", "need_subtitles",
+            "need_bgm", "target_duration", "duration_tolerance",
+        }
+        patch = {
+            key: value for key, value in (updates or {}).items()
+            if key in allowed_fields and value is not None
+        }
+        if requirements is None:
+            revised_items = list(spec.requirements)
+        else:
+            revised_items = []
+            for raw in requirements:
+                payload = {
+                    key: value for key, value in raw.items()
+                    if key in RequirementItem.model_fields and value is not None and value != ""
+                }
+                if "id" not in payload:
+                    payload.pop("id", None)
+                payload.setdefault("status", "confirmed")
+                revised_items.append(RequirementItem.model_validate(payload))
+        patch.update({
+            "version": spec.version + 1,
+            "status": "draft",
+            "confirmed_at": None,
+            "requirements": revised_items,
+            "open_questions": [] if clear_open_questions else spec.open_questions,
+            "created_at": datetime.now(),
+        })
+        revised_spec = spec.model_copy(update=patch)
+        visible_instruction = RequirementAgent._build_visible_instruction(revised_spec)
+        revised_execution = execution.model_copy(update={
+            "version": execution.version + 1,
+            "requirement_spec_version": revised_spec.version,
+            "visible_instruction": visible_instruction,
+            "included_requirement_ids": [item.id for item in revised_items],
+            "status": "draft",
+            "confirmed_at": None,
+        })
+        try:
+            slots = self.store.read_requirement_slots(spec.version)
+        except (FileNotFoundError, ValueError):
+            slots = []
+        slot_updates = {
+            "purpose": revised_spec.purpose,
+            "audience": revised_spec.audience,
+            "target_duration": revised_spec.target_duration,
+            "style": revised_spec.style,
+        }
+        revised_slots = [
+            slot.model_copy(update={
+                "value": slot_updates[slot.key],
+                "status": "confirmed",
+                "source_type": "clarification",
+                "source_ref": f"requirement_v{revised_spec.version}",
+                "question": None,
+            }) if slot.key in slot_updates else slot
+            for slot in slots
+        ]
+        brief = self.store.read_model("requirement_brief.json", RequirementBrief)
+        revised_gate = self.store.save_requirement_revision(
+            brief, spec, revised_spec, revised_execution, actor_id, slots=revised_slots,
+        )
+        previous_legacy = self.store.read_model(
+            f"legacy_requirement_v{spec.version}.json", VideoRequirement
+        )
+        revised_legacy = previous_legacy.model_copy(update={
+            "target_duration": int(revised_spec.target_duration),
+            "style": revised_spec.style,
+            "need_subtitles": revised_spec.need_subtitles,
+            "need_bgm": revised_spec.need_bgm,
+            "focus_keywords": [
+                item.description for item in revised_items if item.category == "content"
+            ][:8],
+        })
+        self.store.write_model(
+            f"legacy_requirement_v{revised_spec.version}.json", revised_legacy
+        )
+        if state == "awaiting_requirement_clarification":
+            self._transition(
+                "clarification_applied",
+                f"requirement-editor-applied-v{revised_spec.version}",
+                actor_id=actor_id,
+            )
+        if revised_spec.open_questions:
+            self._transition(
+                "clarification_required",
+                f"clarification-required-v{revised_spec.version}",
+                actor_id=actor_id,
+            )
+        self.status.requirement_spec = revised_spec
+        self.status.execution_brief = revised_execution
+        self.status.requirement_gate = revised_gate
+        self.status.requirement = revised_legacy
+        self._write_manifest(
+            self.status.task_snapshot.state,
+            requirement_version=str(revised_spec.version),
+        )
+        return revised_spec
+
+    def analyze_confirmed_requirement(
+        self,
+        video_path: str,
+        generate_previews: bool = False,
+    ) -> EditScript:
+        """只接受已确认需求版本，生成候选与粗剪计划。"""
+        if not self.store or not self.state_machine or not self.status.requirement_spec:
+            raise ValueError("没有已确认的需求任务书")
+        spec = self.status.requirement_spec
+        if not self.store.is_approved("requirement", spec.id, spec.version):
+            raise ValueError("需求任务书尚未确认，不能开始素材分析")
+        if self.status.task_snapshot and self.status.task_snapshot.state not in {
+            "style_recommended", "style_skipped"
+        }:
+            raise ValueError(f"当前状态 {self.status.task_snapshot.state} 不能开始素材分析")
+        self._transition("analysis_started", f"analysis-started-v{spec.version}")
+        requirement = self.store.read_model(f"legacy_requirement_v{spec.version}.json", VideoRequirement)
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest(self.status.step, requirement_version=str(spec.version))
+        try:
+            with model_call_context(
+                self.task_dir,
+                stage="transcription_summary",
+                prompt_template_version="content-summary-v1",
+                input_spec_id=spec.id,
+                input_spec_version=spec.version,
+            ):
+                analysis = self.agent2.run(video_path, requirement)
+        except Exception as error:
+            self._fail_task("transcription_failed", error)
+            raise
+        if not self.status.execution_brief:
+            raise ValueError("缺少已确认的 AI 执行说明")
+        try:
+            with model_call_context(
+                self.task_dir,
+                stage="candidate_analysis",
+                prompt_template_version="candidate-tools-v1",
+                input_spec_id=spec.id,
+                input_spec_version=spec.version,
+            ):
+                generation = self.candidate_agent.run(
+                    self.status.execution_brief,
+                    spec.requirements,
+                    analysis.evidence,
+                    analysis.video_duration,
+                )
+        except Exception as error:
+            self._fail_task("candidate_analysis_failed", error)
+            raise
+        highlights = [
+            HighlightClip(
+                start=candidate.source_start,
+                end=candidate.source_end,
+                text=" / ".join(citation.quote for citation in candidate.citations),
+                importance=candidate.confidence,
+                category="highlight",
+                reason=candidate.selection_reason,
+                suggestion="；".join(candidate.risk_flags) or None,
+                candidate_id=candidate.id,
+                matched_requirement_ids=candidate.matched_requirement_ids,
+                evidence_ids=[citation.evidence_id for citation in candidate.citations],
+            )
+            for candidate in generation.valid_candidates
+        ]
+        valid_candidates = list(generation.valid_candidates)
+        valid_candidate_ids = {candidate.id for candidate in valid_candidates}
+        rejected_candidates = [
+            candidate for candidate in generation.candidates
+            if candidate.id not in valid_candidate_ids
+        ]
+        analysis = analysis.model_copy(
+            update={"candidate_clips": valid_candidates, "highlights": highlights}
+        )
+        self.store.write_payload(
+            "candidate_generation.json",
+            {
+                "valid_candidate_ids": generation.valid_ids,
+                "retrieval_trace": generation.retrieval_trace,
+                "missing_must_requirement_ids": getattr(
+                    generation, "missing_must_requirement_ids", []
+                ),
+                "rejected_candidate_ids": [item.id for item in rejected_candidates],
+            },
+        )
+        self.store.write_payload(
+            "retrieval_trace.json",
+            {
+                "retrieval_trace": generation.retrieval_trace,
+                "missing_must_requirement_ids": getattr(
+                    generation, "missing_must_requirement_ids", []
+                ),
+            },
+        )
+        self.store.write_payload(
+            "candidate_clips.json",
+            {"candidates": [candidate.model_dump(mode="json") for candidate in valid_candidates]},
+        )
+        self.store.write_payload(
+            "rejected_candidate_suggestions.json",
+            {"candidates": [candidate.model_dump(mode="json") for candidate in rejected_candidates]},
+        )
+        self.store.write_payload(
+            "evidence.json",
+            {"evidence": [item.model_dump(mode="json") for item in analysis.evidence]},
+        )
+        self.store.write_payload(
+            "transcript.json",
+            {"segments": [item.model_dump(mode="json") for item in analysis.transcript]},
+        )
+        self.store.write_model("analysis.json", analysis)
+        try:
+            script = self.agent3.run(analysis, requirement, spec.requirements)
+        except Exception as error:
+            self._fail_task("planning_failed", error)
+            raise
         self.status.requirement = requirement
         self.status.analysis = analysis
         self.status.script = script
-        self.status.step = "awaiting_confirmation"
-        self._write_json("edit_plan.json", script.model_dump())
+        plan_service = getattr(self, "plan_service", None) or EditPlanService()
+        try:
+            plan = plan_service.create(spec=spec, analysis=analysis, script=script)
+            plan_gate = self.store.save_plan_draft(plan)
+        except Exception as error:
+            self._fail_task("planning_failed", error)
+            raise
+        self.status.edit_plan = plan
+        self.status.plan_gate = plan_gate
+        self.store.write_model("edit_plan.json", script)
         if generate_previews:
             self.preview_paths = self._create_previews(video_path, script)
-        self._write_manifest("awaiting_confirmation")
+        self._transition("review_ready", f"review-ready-plan-v{plan.version}")
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest(
+            self.status.step,
+            requirement_version=str(spec.version),
+            edit_plan_version=str(plan.version),
+        )
         return script
 
     def render(self, script: EditScript, video_path: str, output_path: str = "") -> ExecutionResult:
-        """仅渲染已经确认的剪辑计划。"""
-        if not output_path and self.task_dir:
-            output_path = str(self.task_dir / "final.mp4")
-        if self.task_dir and script.srt_subtitles:
-            (self.task_dir / "subtitles.srt").write_text(script.srt_subtitles, encoding="utf-8")
-        result = self.agent4.run(script, video_path, output_path)
+        """兼容入口；只接受当前已批准计划完全匹配的执行视图。"""
+        plan = self.status.edit_plan
+        if not plan or plan.status != "approved" or plan.execution_script != script:
+            raise ValueError("未批准计划不能渲染；请先审核并批准当前计划版本")
+        return self.render_approved_plan(plan, video_path, output_path)
+
+    def revise_edit_plan(
+        self,
+        *,
+        selected_candidate_ids: Optional[list[str]] = None,
+        segment_updates: Optional[dict[str, dict]] = None,
+        manual_segments: Optional[list[dict]] = None,
+        delivery_updates: Optional[dict] = None,
+        actor_id: Optional[str] = None,
+    ) -> AuditableEditPlan:
+        if not self.store or not self.status.edit_plan or not self.status.analysis:
+            raise ValueError("没有可修订的剪辑计划")
+        state = self.status.task_snapshot.state if self.status.task_snapshot else ""
+        if state not in {"awaiting_review", "plan_approved", "awaiting_delivery_resolution"}:
+            raise ValueError(f"当前状态 {state} 不能修改剪辑计划")
+        previous = self.status.edit_plan
+        prepared_manual_segments = []
+        if manual_segments:
+            valid_requirement_ids = {
+                item.id for item in self.status.requirement_spec.requirements
+            } if self.status.requirement_spec else set()
+            evidence = list(self.status.analysis.evidence)
+            evidence_ids = {item.id for item in evidence}
+            for raw in manual_segments:
+                matched_ids = list(dict.fromkeys(raw.get("matched_requirement_ids", [])))
+                if not matched_ids or not set(matched_ids).issubset(valid_requirement_ids):
+                    raise ValueError("人工补片必须关联至少一个当前任务书中的需求 ID")
+                start = float(raw["source_start"])
+                end = float(raw["source_end"])
+                annotation = str(
+                    raw.get("annotation")
+                    or raw.get("subtitle_text")
+                    or raw.get("title_text")
+                    or "用户人工确认该时间段应进入成片"
+                ).strip()
+                fingerprint = (
+                    f"{self.store.task_id}|{start:.3f}|{end:.3f}|{annotation}"
+                ).encode("utf-8")
+                digest = hashlib.sha256(fingerprint).hexdigest()
+                evidence_id = f"user_evidence_{digest[:16]}"
+                if evidence_id not in evidence_ids:
+                    evidence.append(
+                        Evidence(
+                            id=evidence_id,
+                            type="user_annotation",
+                            source_start=start,
+                            source_end=end,
+                            content=annotation,
+                            content_hash=digest,
+                            metadata={
+                                "actor_id": actor_id,
+                                "source": "manual_timeline_add",
+                            },
+                        )
+                    )
+                    evidence_ids.add(evidence_id)
+                    self.store.append_audit(
+                        AuditEvent(
+                            task_id=self.store.task_id,
+                            action="user_annotation_created",
+                            subject_type="Evidence",
+                            subject_id=evidence_id,
+                            actor_type="user",
+                            actor_id=actor_id,
+                            summary=f"用户为 {start:.1f}–{end:.1f} 秒人工补片创建了可追溯标注证据。",
+                        )
+                    )
+                prepared_manual_segments.append({
+                    **raw,
+                    "matched_requirement_ids": matched_ids,
+                    "evidence_ids": [
+                        *list(dict.fromkeys(raw.get("evidence_ids", []))),
+                        evidence_id,
+                    ],
+                })
+            self.status.analysis = self.status.analysis.model_copy(
+                update={"evidence": evidence}
+            )
+            self.store.write_model("analysis.json", self.status.analysis)
+            self.store.write_payload(
+                "evidence.json",
+                {"evidence": [item.model_dump(mode="json") for item in evidence]},
+            )
+        plan_service = getattr(self, "plan_service", None) or EditPlanService()
+        revised, decisions = plan_service.revise(
+            task_id=self.store.task_id,
+            plan=previous,
+            analysis=self.status.analysis,
+            selected_candidate_ids=selected_candidate_ids,
+            segment_updates=segment_updates,
+            manual_segments=prepared_manual_segments,
+            delivery_updates=delivery_updates,
+            actor_id=actor_id,
+        )
+        gate = self.store.save_plan_draft(
+            revised,
+            actor_id=actor_id,
+            previous_plan=previous,
+        )
+        self.store.append_decisions(decisions)
+        if previous.delivery_spec != revised.delivery_spec:
+            self.store.append_audit(
+                AuditEvent(
+                    task_id=self.store.task_id,
+                    action="delivery_spec_revised",
+                    subject_type="DeliverySpec",
+                    subject_id=revised.delivery_spec.id,
+                    subject_version=revised.delivery_spec.version,
+                    actor_type="user",
+                    actor_id=actor_id,
+                    summary="用户修改了字幕、转场、片头片尾、标题、BGM 或风格组合，系统生成新的交付规格版本。",
+                    metadata={
+                        "style_bundle_id": revised.delivery_spec.style_bundle_id,
+                    },
+                )
+            )
+        if state == "plan_approved":
+            self._transition(
+                "review_invalidated",
+                f"review-invalidated-plan-v{revised.version}",
+                actor_id=actor_id,
+            )
+        elif state == "awaiting_delivery_resolution":
+            self._transition(
+                "delivery_revision_requested",
+                f"delivery-revision-plan-v{revised.version}",
+                actor_id=actor_id,
+            )
+            self.status.delivery_report = None
+        self.status.edit_plan = revised
+        self.status.plan_gate = gate
+        self.status.script = revised.execution_script
+        self._write_manifest(
+            "awaiting_review",
+            edit_plan_version=str(revised.version),
+        )
+        return revised
+
+    def approve_current_plan(self, actor_id: Optional[str] = None) -> AuditableEditPlan:
+        if not self.store or not self.status.edit_plan or not self.status.plan_gate:
+            raise ValueError("没有可批准的剪辑计划")
+        if not self.status.requirement_spec or not self.status.analysis:
+            raise ValueError("缺少需求或分析结果")
+        plan_service = getattr(self, "plan_service", None) or EditPlanService()
+        validation = plan_service.validate(
+            self.status.edit_plan,
+            self.status.requirement_spec,
+            self.status.analysis.candidate_clips,
+            self.status.analysis.video_duration,
+            known_evidence_ids=[item.id for item in self.status.analysis.evidence],
+            user_annotation_evidence_ids=[
+                item.id for item in self.status.analysis.evidence
+                if item.type == "user_annotation"
+            ],
+        )
+        if not validation.valid:
+            raise ValueError("计划校验失败：" + "；".join(validation.errors))
+        approved, gate = self.store.approve_plan(self.status.plan_gate.id, actor_id)
+        self.status.edit_plan = approved
+        self.status.plan_gate = gate
+        self.status.script = approved.execution_script
+        self._write_json(
+            "confirmed_edit_plan.json",
+            approved.execution_script.model_dump(),
+        )
+        self._transition(
+            "plan_approved",
+            f"plan-approved-v{approved.version}",
+            actor_id=actor_id,
+        )
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest(self.status.step, edit_plan_version=str(approved.version))
+        return approved
+
+    def render_approved_plan(
+        self,
+        plan: AuditableEditPlan,
+        video_path: str,
+        output_path: str = "",
+    ) -> ExecutionResult:
+        render_lock = getattr(self, "_render_lock", None)
+        if render_lock is None:
+            render_lock = threading.Lock()
+            self._render_lock = render_lock
+        if not render_lock.acquire(blocking=False):
+            raise ValueError("当前任务正在渲染，请勿重复提交")
+        try:
+            return self._render_approved_plan_locked(plan, video_path, output_path)
+        finally:
+            render_lock.release()
+
+    def _render_approved_plan_locked(
+        self,
+        plan: AuditableEditPlan,
+        video_path: str,
+        output_path: str = "",
+    ) -> ExecutionResult:
+        if not self.store or not self.state_machine or not self.task_dir:
+            raise ValueError("任务尚未初始化")
+        if not self.status.requirement_spec or not self.status.analysis:
+            raise ValueError("缺少验收所需的需求或分析结果")
+        if plan.status != "approved":
+            raise ValueError("未批准计划不能渲染")
+        if not self.store.is_approved("edit_plan", plan.id, plan.version):
+            raise ValueError("当前计划版本没有有效审核 Gate")
+        if self.status.task_snapshot and self.status.task_snapshot.state != "plan_approved":
+            raise ValueError(f"当前状态 {self.status.task_snapshot.state} 不能渲染")
+        if not output_path:
+            output_path = str(self.task_dir / f"final_v{plan.version}.mp4")
+        self._transition("render_started", f"render-started-plan-v{plan.version}")
+        self._write_manifest("rendering", edit_plan_version=str(plan.version))
+        if plan.execution_script.srt_subtitles:
+            (self.task_dir / "subtitles.srt").write_text(
+                plan.execution_script.srt_subtitles,
+                encoding="utf-8",
+            )
+            (self.task_dir / f"subtitles_v{plan.version}.srt").write_text(
+                plan.execution_script.srt_subtitles,
+                encoding="utf-8",
+            )
+        backend = getattr(self, "render_backend", None) or FFmpegRenderBackend(self.agent4)
+        try:
+            result = backend.render(plan.execution_script, video_path, output_path)
+        except Exception as error:
+            result = ExecutionResult(
+                success=False,
+                output_path=output_path,
+                output_duration=0.0,
+                operations_done=0,
+                operations_failed=len(plan.execution_script.operations),
+                errors=[f"render_backend_exception:{type(error).__name__}:{error}"],
+                log="渲染后端抛出未处理异常，Harness 已将任务置为 failed。",
+            )
         self.status.result = result
-        self.status.step = "done" if result.success else "error"
+        self._write_json("execution_result.json", result.model_dump())
+        self._write_json(f"execution_result_v{plan.version}.json", result.model_dump())
+        (self.task_dir / "render.log").write_text(result.log, encoding="utf-8")
+        (self.task_dir / f"render_v{plan.version}.log").write_text(result.log, encoding="utf-8")
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action="render_completed" if result.success else "render_failed",
+                subject_type="AuditableEditPlan",
+                subject_id=plan.id,
+                subject_version=plan.version,
+                summary="系统完成了批准计划的渲染。" if result.success else "批准计划渲染失败。",
+            )
+        )
+        if not result.success:
+            self._transition(
+                "task_failed",
+                f"render-failed-plan-v{plan.version}",
+                payload={"error_code": "render_failed", "error_message": "；".join(result.errors)},
+            )
+            self.status.step = "failed"
+            self._write_manifest("failed", output_path=result.output_path)
+            return result
+
+        self._transition("render_completed", f"render-completed-plan-v{plan.version}")
+        self._write_manifest("verifying", output_path=result.output_path)
+        verifier = getattr(self, "verification_engine", None) or VerificationEngine()
+        try:
+            report = verifier.verify(
+                task_id=self.store.task_id,
+                execution_result=result,
+                spec=self.status.requirement_spec,
+                plan=plan,
+                candidates=self.status.analysis.candidate_clips,
+            )
+        except Exception as error:
+            self._fail_task("verification_failed", error)
+            failed_result = result.model_copy(update={
+                "success": False,
+                "errors": [
+                    *result.errors,
+                    f"verification_exception:{type(error).__name__}:{error}",
+                ],
+            })
+            self.status.result = failed_result
+            self._write_json("execution_result.json", failed_result.model_dump())
+            self._write_json(
+                f"execution_result_v{plan.version}.json",
+                failed_result.model_dump(),
+            )
+            return failed_result
+        self.store.write_model("verification_report.json", report)
+        self.store.write_model(f"verification_report_v{plan.version}.json", report)
+        self.store.write_model("delivery_report.json", report)
+        self.store.write_model(f"delivery_report_v{plan.version}.json", report)
+        self.status.delivery_report = report
         self.status.completed_at = datetime.now().isoformat()
-        if self.task_dir:
-            self._write_json("execution_result.json", result.model_dump())
-            (self.task_dir / "render.log").write_text(result.log, encoding="utf-8")
-            self._write_manifest("succeeded" if result.success else "failed", output_path=result.output_path)
+        if report.status == "passed":
+            self._transition(
+                "verification_passed",
+                f"verification-passed-plan-v{plan.version}",
+            )
+        else:
+            self._transition(
+                "delivery_resolution_required",
+                f"delivery-resolution-plan-v{plan.version}",
+            )
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest(
+            self.status.step,
+            output_path=result.output_path,
+            delivery_report_id=report.id,
+        )
         return result
+
+    def resolve_delivery(
+        self,
+        *,
+        actor_id: str,
+        exception_reason: str,
+    ) -> DeliveryReport:
+        if not self.store or not self.status.delivery_report:
+            raise ValueError("没有待处理的交付报告")
+        verifier = getattr(self, "verification_engine", None) or VerificationEngine()
+        approved = verifier.approve_exceptions(
+            self.status.delivery_report,
+            actor_id=actor_id,
+            reason=exception_reason,
+        )
+        self.store.write_model("delivery_report.json", approved)
+        self.store.write_model(
+            f"delivery_report_v{approved.edit_plan_version}.json",
+            approved,
+        )
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action="delivery_exception_approved",
+                subject_type="DeliveryReport",
+                subject_id=approved.id,
+                actor_type="user",
+                actor_id=actor_id,
+                summary="用户填写原因并批准了交付例外。",
+                metadata={"reason": exception_reason},
+            )
+        )
+        self.status.delivery_report = approved
+        self._transition(
+            "delivery_approved",
+            f"delivery-approved-{approved.id}",
+            actor_id=actor_id,
+        )
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest("succeeded", output_path=approved.output_path)
+        return approved
 
     def confirm_and_render(
         self,
@@ -200,28 +1111,31 @@ class VideoEditOrchestrator:
         outro_style: str = "none",
         title_text: str = "",
     ) -> ExecutionResult:
-        """应用用户的片段选择后再渲染，防止未确认计划直接导出。"""
-        if self.status.analysis is None:
+        """兼容 UI 的单按钮操作：修订 → 校验 → 批准 → 渲染。"""
+        if self.status.analysis is None or self.status.edit_plan is None:
             raise ValueError("没有可确认的分析结果，请先生成剪辑方案")
-        confirmed = self.agent3.apply_selection(
-            script,
-            self.status.analysis,
-            selected_orders,
-            transition_duration=transition_duration,
-            subtitle_style=subtitle_style,
-            bgm_path=bgm_path,
-            bgm_volume=bgm_volume,
-            intro_style=intro_style,
-            outro_style=outro_style,
-            title_text=title_text,
+        selected_ids = [
+            segment.candidate_id
+            for segment in self.status.edit_plan.timeline_segments
+            if segment.order in set(selected_orders)
+        ]
+        revised = self.revise_edit_plan(
+            selected_candidate_ids=selected_ids,
+            delivery_updates={
+                "transition_duration": transition_duration,
+                "subtitle_style": subtitle_style,
+                "bgm_path": bgm_path or None,
+                "bgm_volume": bgm_volume,
+                "intro_style": intro_style,
+                "outro_style": outro_style,
+                "title_text": title_text.strip() or script.title,
+            },
+            actor_id="local-user",
         )
-        if not confirmed.operations:
+        if not revised.timeline_segments:
             raise ValueError("请至少保留一个片段")
-        self.status.script = confirmed
-        if self.task_dir:
-            self._write_json("confirmed_edit_plan.json", confirmed.model_dump())
-            self._write_manifest("rendering")
-        return self.render(confirmed, video_path, output_path)
+        approved = self.approve_current_plan("local-user")
+        return self.render_approved_plan(approved, video_path, output_path)
 
     def _create_previews(self, video_path: str, script: EditScript) -> dict[str, str]:
         """生成候选片段预览；失败不影响主剪辑流程。"""
@@ -238,18 +1152,74 @@ class VideoEditOrchestrator:
                 previews[str(operation.order)] = str(preview_path.resolve())
         return previews
 
+    def _transition(
+        self,
+        event: str,
+        idempotency_key: str,
+        *,
+        actor_id: Optional[str] = None,
+        payload: Optional[dict] = None,
+    ):
+        if not self.state_machine:
+            raise ValueError("任务状态机尚未初始化")
+        snapshot = self.state_machine.load()
+        updated, _, _ = self.state_machine.apply(
+            event,
+            expected_version=snapshot.version,
+            idempotency_key=idempotency_key,
+            actor_id=actor_id,
+            payload=payload,
+        )
+        self.status.task_snapshot = updated
+        self.status.step = updated.state
+        return updated
+
+    def _fail_task(self, error_code: str, error: Exception) -> None:
+        """把未处理阶段异常转成唯一业务失败状态，同时保留已有产物。"""
+        message = f"{type(error).__name__}: {error}"[:1000]
+        if self.state_machine:
+            snapshot = self.state_machine.load()
+            if snapshot.state not in {"succeeded", "failed"}:
+                self._transition(
+                    "task_failed",
+                    f"task-failed-{error_code}-v{snapshot.version}",
+                    payload={"error_code": error_code, "error_message": message},
+                )
+        if self.store:
+            self.store.append_audit(
+                AuditEvent(
+                    task_id=self.store.task_id,
+                    action="task_failed",
+                    subject_type="Task",
+                    subject_id=self.store.task_id,
+                    summary=f"任务因 {error_code} 停止；已完成产物保留用于恢复和排查。",
+                    metadata={"error_code": error_code},
+                )
+            )
+        self._write_manifest("failed", error_code=error_code, error_message=message)
+
     def _write_json(self, filename: str, payload: dict) -> None:
         if self.task_dir:
             destination = self.task_dir / filename
-            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary = destination.with_name(
+                f".{destination.name}.{uuid.uuid4().hex}.tmp"
+            )
             temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(destination)
 
     def _write_manifest(self, state: str, **extra: str) -> None:
         if self.task_dir:
+            existing = {}
+            destination = self.task_dir / "manifest.json"
+            if destination.exists():
+                try:
+                    existing = json.loads(destination.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = {}
             self._write_json(
                 "manifest.json",
                 {
+                    **existing,
                     "task_id": self.task_dir.name,
                     "state": state,
                     "updated_at": datetime.now().isoformat(),

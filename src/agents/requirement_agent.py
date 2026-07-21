@@ -27,7 +27,23 @@ Python 知识点：
 
 from src.agents.base import BaseAgent
 from src.tools.llm import call_llm
-from src.models.schemas import VideoRequirement
+import re
+from typing import Optional
+
+from src.domain_config import get_domain_config
+from src.models.schemas import (
+    ExecutionBrief,
+    RequirementBrief,
+    RequirementCompilation,
+    RequirementItem,
+    RequirementSlot,
+    RequirementSpec,
+    VideoRequirement,
+)
+
+
+class RequirementParsingError(RuntimeError):
+    """LLM 未能产出合法需求；调用方必须显式进入人工草稿流程。"""
 
 
 # ============================================================
@@ -110,14 +126,15 @@ class RequirementAgent(BaseAgent):
           VideoRequirement: 结构化的剪辑需求
 
         可能的异常：
-          - LLM 返回的 JSON 格式不对 → 返回默认需求
-          - API 调用失败 → 抛出异常
+          - LLM 返回非法 JSON/字段或 API 调用失败 → 抛出 RequirementParsingError
+
+        这里禁止返回默认正式需求。降级为人工草稿由 ``compile`` 显式处理，
+        从而让界面、审计记录和用户都能知道模型没有成功理解需求。
         """
         self.log(f"收到用户需求: {user_input[:100]}...")
         self._start_timer()
 
         try:
-            # 调用大模型解析需求
             raw_response = call_llm(
                 system_prompt=SYSTEM_PROMPT,
                 user_message=user_input,
@@ -125,25 +142,300 @@ class RequirementAgent(BaseAgent):
                 temperature=0.3,  # 需求解析偏保守，减少随机性
             )
 
-            # 用 Pydantic 校验 + 补全默认值
             requirement = VideoRequirement(**raw_response)
             self.log(f"需求解析完成: {requirement.model_dump()}")
+        except Exception as error:
+            self.log(f"需求解析失败: {type(error).__name__}", level="error")
             self._end_timer()
-            return requirement
+            raise RequirementParsingError(
+                "AI 需求解析失败，系统没有生成默认正式需求"
+            ) from error
+        self._end_timer()
+        return requirement
 
-        except Exception as e:
-            self.log(f"需求解析失败: {e}", level="error")
-            self.log("使用默认需求参数", level="warning")
+    def compile(
+        self,
+        user_input: str,
+        scenario: str = "school",
+        submitted_by: Optional[str] = None,
+        overrides: Optional[dict] = None,
+    ) -> RequirementCompilation:
+        """把自然语言编译为可修改、可审核、可追溯的需求任务书。
 
-            # 降级方案：返回默认需求
-            default_req = VideoRequirement(
+        ``run`` 保留给旧流水线使用；新工作流从这里开始。模型负责抽取，
+        版本、验收规则和用户可见执行说明由确定性代码建立，避免隐藏 Prompt
+        成为任务的唯一事实来源。
+        """
+        if scenario not in {"school", "enterprise"}:
+            raise ValueError("scenario 只能是 school 或 enterprise")
+        raw_text = user_input.strip()
+        if not raw_text:
+            raise ValueError("请先填写剪辑需求")
+
+        brief = RequirementBrief(
+            scenario=scenario,
+            raw_text=raw_text,
+            submitted_by=submitted_by,
+        )
+        mode = "llm_generated"
+        warnings: list[str] = []
+        try:
+            requirement = self.run(raw_text)
+        except RequirementParsingError:
+            mode = "manual_required"
+            warnings.append(
+                "AI 未能完成需求解析；当前草稿仅使用表单显式值和中性占位值，必须由用户核对后才能继续。"
+            )
+            requirement = VideoRequirement(
                 target_duration=300,
                 video_type="general",
-                style="exciting",
+                style="formal",
                 focus_keywords=[],
+                need_subtitles=True,
+                need_bgm=False,
             )
-            self._end_timer()
-            return default_req
+        requirement = self._apply_overrides(requirement, overrides)
+        domain = get_domain_config(scenario)
+        items = self._build_requirement_items(raw_text, requirement)
+        questions = self._build_open_questions(raw_text, items, scenario)
+        if mode == "manual_required":
+            questions.insert(0, "请核对目标时长、风格、重点内容和字幕设置，并说明是否按当前草稿继续。")
+            questions = questions[:5]
+        spec = RequirementSpec(
+            brief_id=brief.id,
+            purpose=self._infer_purpose(raw_text, scenario),
+            audience=domain["audience"],
+            video_type=requirement.video_type,
+            style=requirement.style,
+            need_subtitles=requirement.need_subtitles,
+            need_bgm=requirement.need_bgm,
+            target_duration=requirement.target_duration,
+            duration_tolerance=max(10.0, min(30.0, requirement.target_duration * 0.1)),
+            requirements=items,
+            open_questions=questions,
+        )
+        visible_instruction = self._build_visible_instruction(spec)
+        if mode == "manual_required":
+            visible_instruction = (
+                "注意：AI 需求解析失败。以下执行说明由原始需求、表单显式值和中性占位值生成，"
+                "尚未代表用户确认。\n" + visible_instruction
+            )
+        execution = ExecutionBrief(
+            requirement_spec_id=spec.id,
+            requirement_spec_version=spec.version,
+            visible_instruction=visible_instruction,
+            included_requirement_ids=[item.id for item in items],
+        )
+        slots = self._build_slots(
+            raw_text,
+            spec,
+            scenario=scenario,
+            overrides=overrides,
+            manual_required=mode == "manual_required",
+        )
+        self.log(f"已编译需求任务书 v{spec.version}，包含 {len(items)} 条要求和 {len(questions)} 个待确认问题")
+        return RequirementCompilation(
+            brief=brief,
+            spec=spec,
+            execution_brief=execution,
+            legacy_requirement=requirement,
+            mode=mode,
+            warnings=warnings,
+            slots=slots,
+        )
+
+    @staticmethod
+    def _apply_overrides(
+        requirement: VideoRequirement,
+        overrides: Optional[dict],
+    ) -> VideoRequirement:
+        """只接受 VideoRequirement 已声明字段；空关键词列表也是用户的有效选择。"""
+        if not overrides:
+            return requirement
+        allowed_fields = set(VideoRequirement.model_fields)
+        explicit_values = {
+            key: value
+            for key, value in overrides.items()
+            if key in allowed_fields and value is not None and value != ""
+        }
+        return VideoRequirement.model_validate(
+            {**requirement.model_dump(), **explicit_values}
+        )
+
+    @staticmethod
+    def _build_requirement_items(raw_text: str, requirement: VideoRequirement) -> list[RequirementItem]:
+        """将可执行关键词转为业务要求；明确的必须/禁止项附带验收规则。"""
+        items: list[RequirementItem] = []
+        for keyword in requirement.focus_keywords[:8]:
+            is_must = bool(re.search(rf"(?:必须|一定要|务必).{{0,16}}{re.escape(keyword)}|{re.escape(keyword)}.{{0,8}}(?:必须|一定要|务必)", raw_text))
+            items.append(
+                RequirementItem(
+                    category="content",
+                    description=f"优先保留与“{keyword}”相关的有效画面或发言",
+                    priority="must" if is_must else "should",
+                    status="needs_confirmation" if is_must else "draft",
+                    acceptance_rule=(f"成片中至少有一个已确认片段覆盖“{keyword}”，并引用转录或人工标注证据" if is_must else None),
+                )
+            )
+        for keyword in requirement.avoid_keywords[:8]:
+            items.append(
+                RequirementItem(
+                    category="restriction",
+                    description=f"不得包含与“{keyword}”相关的内容",
+                    priority="prohibited",
+                    status="needs_confirmation",
+                    acceptance_rule=f"候选片段与最终时间线不得命中“{keyword}”；无法自动判断时标记人工复核",
+                )
+            )
+        if not items:
+            items.append(
+                RequirementItem(
+                    category="content",
+                    description="从素材中筛选能代表活动主题和氛围的片段",
+                    priority="should",
+                    status="needs_confirmation",
+                )
+            )
+        return items
+
+    @staticmethod
+    def _build_open_questions(
+        raw_text: str,
+        items: list[RequirementItem],
+        scenario: str,
+    ) -> list[str]:
+        questions: list[str] = []
+        domain = get_domain_config(scenario)
+        if not any(item.priority == "must" for item in items):
+            questions.append("是否有必须出现的人物、环节、奖项、产品或组织名称？")
+        if not re.search(r"(发布|公众号|抖音|视频号|内网|汇报|宣传)", raw_text):
+            questions.append("成片将发布到哪里，主要给谁看？")
+        risk_terms = [*domain["must_check"], *domain["privacy"]]
+        if not any(term in raw_text for term in risk_terms) and not re.search(
+            r"(人名|姓名|职务|奖项|确认|隐私|未成年人|产品名|合作伙伴)", raw_text
+        ):
+            questions.append(
+                "是否涉及需要人工核对的"
+                + "、".join(domain["must_check"])
+                + "，或需要注意的"
+                + "、".join(domain["privacy"])
+                + "？"
+            )
+        return questions[:5]
+
+    @staticmethod
+    def _build_slots(
+        raw_text: str,
+        spec: RequirementSpec,
+        *,
+        scenario: str,
+        overrides: Optional[dict],
+        manual_required: bool,
+    ) -> list[RequirementSlot]:
+        """将任务书投影为带来源的槽位，后续澄清只补丁这些槽位。"""
+        explicit = overrides or {}
+        publish_match = re.search(r"(公众号|抖音|视频号|内网|汇报|宣传|官网)", raw_text)
+        focus_explicit = "focus_keywords" in explicit
+        duration_explicit = "target_duration" in explicit
+        style_explicit = "style" in explicit
+        domain = get_domain_config(scenario)
+        return [
+            RequirementSlot(
+                key="purpose",
+                label="视频用途",
+                value=spec.purpose,
+                status="inferred",
+                source_type="llm" if not manual_required else "domain_config",
+                source_ref=spec.id,
+            ),
+            RequirementSlot(
+                key="audience",
+                label="目标受众",
+                value=spec.audience,
+                status="inferred",
+                source_type="domain_config",
+                source_ref=scenario,
+            ),
+            RequirementSlot(
+                key="target_duration",
+                label="目标时长",
+                value=spec.target_duration,
+                status="confirmed" if duration_explicit else "inferred",
+                source_type="form" if duration_explicit else "llm",
+                source_ref=spec.id,
+            ),
+            RequirementSlot(
+                key="style",
+                label="整体风格",
+                value=spec.style,
+                status="confirmed" if style_explicit else "inferred",
+                source_type="form" if style_explicit else "llm",
+                source_ref=spec.id,
+            ),
+            RequirementSlot(
+                key="focus_keywords",
+                label="重点内容",
+                value=[
+                    item.description for item in spec.requirements
+                    if item.category == "content"
+                ],
+                status=("confirmed" if focus_explicit else "missing"),
+                source_type="form" if focus_explicit else "llm",
+                source_ref=spec.id,
+                question=None if focus_explicit else "请补充必须或优先保留的人物、环节和奖项。",
+            ),
+            RequirementSlot(
+                key="publish_channel",
+                label="发布渠道",
+                value=publish_match.group(1) if publish_match else None,
+                status="confirmed" if publish_match else "missing",
+                source_type="user_input",
+                source_ref="raw_text",
+                question=None if publish_match else "成片将发布到哪里？",
+            ),
+            RequirementSlot(
+                key="high_risk_review",
+                label="高风险信息核对",
+                value={
+                    "must_check": domain["must_check"],
+                    "privacy": domain["privacy"],
+                },
+                status="unknown",
+                risk_level="high",
+                source_type="domain_config",
+                source_ref=scenario,
+                question="请说明本次涉及哪些姓名、职务、奖项、产品或隐私信息。",
+            ),
+        ]
+
+    @staticmethod
+    def _infer_purpose(raw_text: str, scenario: str) -> str:
+        if "汇报" in raw_text:
+            return "活动成果汇报视频"
+        if any(word in raw_text for word in ("宣传", "发布", "公众号", "视频号")):
+            return "活动对外宣传回顾视频"
+        return "学校活动回顾视频" if scenario == "school" else "企业活动回顾视频"
+
+    @staticmethod
+    def _build_visible_instruction(spec: RequirementSpec) -> str:
+        priority_names = {"must": "必须", "should": "应该", "optional": "可选", "prohibited": "禁止"}
+        item_lines = [
+            f"- [{priority_names[item.priority]}] {item.description}"
+            + (f"；验收：{item.acceptance_rule}" if item.acceptance_rule else "")
+            for item in spec.requirements
+        ]
+        subtitle = "需要字幕" if spec.need_subtitles else "不烧录字幕"
+        bgm = "可使用用户提供且已授权的 BGM" if spec.need_bgm else "不自动添加 BGM"
+        return "\n".join(
+            [
+                f"本次任务用于：{spec.purpose}。受众：{spec.audience}。",
+                f"目标成片时长 {spec.target_duration:.0f} 秒，允许误差 ±{spec.duration_tolerance:.0f} 秒；风格为 {spec.style}。",
+                f"交付规则：{subtitle}；{bgm}；输出 MP4。",
+                "内容要求：",
+                *item_lines,
+                "分析时只允许引用已确认的转录片段和用户人工标注；人名、职务、奖项和其他高风险信息必须标记为人工确认。",
+            ]
+        )
 
 
 # ============================================================

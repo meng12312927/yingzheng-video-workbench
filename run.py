@@ -102,15 +102,52 @@ def run_cli():
         if not user_input:
             user_input = "帮我把这个视频剪成3分钟精彩集锦"
 
-    print("\n正在生成剪辑方案...")
+    print("\n正在生成需求任务书...")
     print(f"  视频: {video_path}")
     print(f"  需求: {user_input}")
 
     orchestrator = VideoEditOrchestrator()
     try:
-        script = orchestrator.prepare(video_path, user_input)
+        compilation = orchestrator.create_requirement_draft(video_path, user_input)
     except Exception as error:
-        print(f"\n❌ 生成方案失败: {error}")
+        print(f"\n❌ 生成任务书失败: {error}")
+        return
+
+    spec = compilation.spec
+    if compilation.warnings:
+        print("\n⚠️  本次需求解析需要人工核对：")
+        for warning in compilation.warnings:
+            print(f"  - {warning}")
+    print(f"\n需求任务书 v{spec.version}：")
+    print(f"  用途: {spec.purpose}")
+    print(f"  受众: {spec.audience}")
+    print(f"  目标时长: {spec.target_duration:.0f}s ±{spec.duration_tolerance:.0f}s")
+    for item in spec.requirements:
+        print(f"  - [{item.priority}] {item.description}")
+    print("\nAI 执行说明：")
+    print(compilation.execution_brief.visible_instruction)
+    clarification = ""
+    if spec.open_questions:
+        print("\n待确认问题：")
+        for question in spec.open_questions:
+            print(f"  - {question}")
+        clarification = input("请统一补充说明: ").strip()
+        if not clarification:
+            print("\n❌ 未回答待确认问题，任务已停在需求审核阶段。")
+            return
+    approved = input("确认当前任务书并开始分析？(y/N): ").strip().lower()
+    if approved not in {"y", "yes"}:
+        print("\n任务已停在需求审核阶段，未启动素材分析。")
+        return
+    try:
+        orchestrator.confirm_requirement_draft(
+            orchestrator.status.requirement_gate.id,
+            actor_id="cli-user",
+            clarification_answers=clarification,
+        )
+        script = orchestrator.analyze_confirmed_requirement(video_path)
+    except Exception as error:
+        print(f"\n❌ 证据分析失败: {error}")
         return
 
     if not script.operations:
@@ -137,6 +174,26 @@ def run_cli():
 
     if result.success:
         print(f"\n✅ 剪辑完成！成品: {result.output_path}")
+        report = orchestrator.status.delivery_report
+        if report:
+            print(f"\n逐项交付报告（{report.status}）：")
+            for item in report.results:
+                print(f"  - [{item.status}/{item.method}] {item.summary}")
+            if report.status == "needs_resolution":
+                decision = input(
+                    "验收存在异常。输入例外原因并批准交付，或直接回车保留任务等待修订: "
+                ).strip()
+                if decision:
+                    try:
+                        approved_report = orchestrator.resolve_delivery(
+                            actor_id="cli-user",
+                            exception_reason=decision,
+                        )
+                        print(f"✅ 已记录例外并批准交付: {approved_report.id}")
+                    except ValueError as error:
+                        print(f"❌ 例外批准失败: {error}")
+                else:
+                    print("任务保留在 awaiting_delivery_resolution，可在电脑审核页继续修订。")
     else:
         print(f"\n❌ 剪辑失败: {result.errors}")
 

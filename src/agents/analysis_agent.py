@@ -33,44 +33,7 @@ from src.models.schemas import (
     HighlightClip,
     ContentAnalysis,
 )
-
-
-# ============================================================
-# System Prompt —— Agent 2 的"眼睛"
-# ============================================================
-
-ANALYSIS_PROMPT = """你是一个专业的视频内容分析师。你的任务是从视频的文字记录中找出最值得放进成片的片段。
-
-## 评分标准（0.0 - 1.0）
-- 0.9-1.0: 绝对要保留的高光时刻（冲刺、获奖、掌声雷动、关键结论）
-- 0.7-0.8: 重要内容（比赛过程、主要论点、精彩发言）
-- 0.5-0.6: 可选内容（过渡、介绍、一般性讨论）
-- 0.3-0.4: 可省略（寒暄、沉默、重复内容）
-- 0.0-0.2: 应该删除（广告、无关闲聊、冗长停顿）
-
-## 特别关注
-- 观众反应：欢呼、掌声、笑声 → 高重要性
-- 情绪波动：激动、紧张、感动 → 中高重要性
-- 关键信息：人名、数字、结论、决定 → 中高重要性
-- 重复内容：同一件事说第二遍 → 低重要性
-
-## 输出格式（严格遵守）
-返回一个 JSON，包含 highlights 数组：
-{
-  "highlights": [
-    {
-      "start": 60.0,
-      "end": 75.5,
-      "text": "片段中的文字内容",
-      "importance": 0.95,
-      "category": "highlight",
-      "reason": "选手冲刺瞬间，全场欢呼",
-      "suggestion": "建议慢放 + 特写"
-    }
-  ],
-  "segment_summary": "这段内容主要讲了..."
-}
-"""
+from src.services.evidence import EvidenceBuilder
 
 
 class AnalysisAgent(BaseAgent):
@@ -97,114 +60,34 @@ class AnalysisAgent(BaseAgent):
         video_path: str,
         requirement: VideoRequirement,
     ) -> ContentAnalysis:
+        """兼容分析接口：只转录与构建证据，不再自由生成高光候选。
+
+        候选必须由 ``CandidateAgent`` 经受限检索和引文校验生成；该方法保留
+        是为了让已有调用方仍可获得转录和摘要。
         """
-        分析视频内容
-
-        参数：
-          video_path: 视频文件路径
-          requirement: Agent 1 输出的结构化需求
-
-        返回值：
-          ContentAnalysis: 包含完整转录 + 高光片段列表
-        """
-        self.log(f"开始分析视频: {video_path}")
-        self._start_timer()
-
-        # ============================================
-        # 第一步：Whisper 语音转文字
-        # ============================================
-        self.log("Step 1/3: Whisper 转录中...")
-        raw_segments = self.whisper.transcribe(video_path)
-        self.log(f"转录完成，共 {len(raw_segments)} 个片段")
-
-        # 包装成 Pydantic 模型
-        transcript = [
-            TranscriptSegment(**seg) for seg in raw_segments
-        ]
-
-        # 视频时长必须来自媒体文件；最后一句话之后可能仍有无声画面。
-        media_info = FFmpegTool.get_video_info(video_path)
-        video_duration = float(media_info["duration"]) if media_info else (transcript[-1].end if transcript else 0)
-        self.log(f"视频总时长: {video_duration:.0f} 秒 ({video_duration/60:.1f} 分钟)")
-
-        # ============================================
-        # 第二步：文本分块 + LLM 分析
-        # ============================================
-        self.log("Step 2/3: LLM 分析关键片段...")
-
-        all_highlights = []
-        chunks = self._split_transcript(transcript, max_duration=120.0, overlap_duration=15.0)
-
-        self.log(f"分为 {len(chunks)} 个文本块进行分析")
-
-        for i, chunk in enumerate(chunks):
-            # 构建发给 LLM 的文本
-            chunk_text = self._format_chunk(chunk, requirement)
-            chunk_start, chunk_end = chunk[0].start, chunk[-1].end
-
-            try:
-                response = call_llm(
-                    system_prompt=ANALYSIS_PROMPT,
-                    user_message=chunk_text,
-                    return_json=True,
-                    temperature=0.3,
-                )
-
-                # 提取高光片段
-                if "highlights" in response:
-                    for h in response["highlights"]:
-                        # 只接受当前文本块内且位于原视频范围内的时间戳。
-                        if (
-                            chunk_start <= h.get("start", -1) < h.get("end", -1) <= chunk_end
-                            and h.get("end", 0) <= video_duration
-                        ):
-                            try:
-                                clip = HighlightClip(**h)
-                                all_highlights.append(clip)
-                            except Exception:
-                                pass  # 跳过格式不对的
-
-            except Exception as e:
-                self.log(f"分析第 {i+1} 块时出错: {e}", level="warning")
-                continue
-
-        self.log(f"共识别 {len(all_highlights)} 个候选片段")
-
-        # ============================================
-        # 第三步：排序 + 去重 + 筛选
-        # ============================================
-        self.log("Step 3/3: 去重排序...")
-
-        # 用需求中的关键词加权
-        for clip in all_highlights:
-            for keyword in requirement.focus_keywords:
-                if keyword in clip.text:
-                    clip.importance = min(1.0, clip.importance + 0.1)
-
-        # 去重：时间重叠超过 50% 的只保留重要性更高的
-        highlights = self._deduplicate(all_highlights)
-
-        # 按重要性排序
-        highlights.sort(key=lambda x: x.importance, reverse=True)
-
-        self.log(f"去重后剩余 {len(highlights)} 个高光片段")
-        if highlights:
-            self.log(f"Top 3: {[(h.importance, h.reason[:30]) for h in highlights[:3]]}")
-
-        # ============================================
-        # 第四步：生成摘要
-        # ============================================
+        transcript, evidence, video_duration = self.transcribe(video_path)
         summary = self._generate_summary(transcript, video_duration, requirement)
-
-        self._end_timer()
-
         return ContentAnalysis(
             video_duration=video_duration,
             transcript=transcript,
-            highlights=highlights,
+            evidence=evidence,
+            highlights=[],
             summary=summary,
             keyword_timeline=self._build_keyword_timeline(transcript, requirement),
         )
+
+    def transcribe(self, video_path: str) -> tuple[list[TranscriptSegment], list, float]:
+        """产生带稳定证据的转录，不在此阶段作内容价值判断。"""
+        self.log(f"开始转录视频: {video_path}")
+        self._start_timer()
+        raw_segments = self.whisper.transcribe(video_path)
+        transcript = [TranscriptSegment(**segment) for segment in raw_segments]
+        evidence = EvidenceBuilder.from_transcript(transcript)
+        media_info = FFmpegTool.get_video_info(video_path)
+        video_duration = float(media_info["duration"]) if media_info else (transcript[-1].end if transcript else 0.0)
+        self._end_timer()
+        self.log(f"转录完成，共 {len(transcript)} 段、{len(evidence)} 条可引用证据")
+        return transcript, evidence, video_duration
 
     # ============================================================
     # 内部辅助方法

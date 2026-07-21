@@ -8,6 +8,7 @@ from src.models.schemas import (
     EditOperation,
     EditScript,
     HighlightClip,
+    RequirementItem,
     TranscriptSegment,
     VideoRequirement,
 )
@@ -22,10 +23,22 @@ class ScriptAgent(BaseAgent):
     def __init__(self):
         super().__init__("ScriptAgent")
 
-    def run(self, analysis: ContentAnalysis, requirement: VideoRequirement) -> EditScript:
+    def run(
+        self,
+        analysis: ContentAnalysis,
+        requirement: VideoRequirement,
+        requirement_items: Optional[list[RequirementItem]] = None,
+    ) -> EditScript:
         self._start_timer()
+        must_ids = {
+            item.id for item in (requirement_items or [])
+            if item.priority == "must"
+        }
         selected = self._select_clips(
-            analysis.highlights, requirement.target_duration, analysis.video_duration
+            analysis.highlights,
+            requirement.target_duration,
+            analysis.video_duration,
+            must_requirement_ids=must_ids,
         )
         operations = [
             EditOperation(
@@ -58,23 +71,50 @@ class ScriptAgent(BaseAgent):
         highlights: list[HighlightClip],
         target_duration: float,
         video_duration: float,
+        must_requirement_ids: Optional[set[str]] = None,
     ) -> list[HighlightClip]:
-        """按评分选片、按时间输出，并保证边界合法且无重叠。"""
+        """先覆盖 must，再按评分补足预算；普通预算不能静默删除 must。"""
         budget = target_duration * 1.15
         selected: list[HighlightClip] = []
         total = 0.0
+        must_ids = set(must_requirement_ids or set())
+
+        def normalise_clip(clip: HighlightClip) -> Optional[HighlightClip]:
+            start = max(0.0, clip.start)
+            end = min(video_duration, clip.end, start + self.MAX_CLIP_DURATION)
+            if end - start < self.MIN_CLIP_DURATION:
+                return None
+            return clip.model_copy(update={"start": start, "end": end})
+
+        uncovered = set(must_ids)
+        must_candidates = sorted(
+            highlights,
+            key=lambda item: (
+                -len(set(item.matched_requirement_ids).intersection(must_ids)),
+                -item.importance,
+                item.start,
+            ),
+        )
+        for clip in must_candidates:
+            covers = set(clip.matched_requirement_ids).intersection(uncovered)
+            if not covers:
+                continue
+            candidate = normalise_clip(clip)
+            if candidate is None or any(self._overlap(candidate, kept) for kept in selected):
+                continue
+            selected.append(candidate)
+            uncovered.difference_update(covers)
+            total += candidate.end - candidate.start
+            if not uncovered:
+                break
 
         for clip in sorted(highlights, key=lambda item: item.importance, reverse=True):
-            start = max(0.0, clip.start)
-            end = min(video_duration, clip.end)
-            duration = end - start
-            if duration < self.MIN_CLIP_DURATION:
+            candidate = normalise_clip(clip)
+            if candidate is None:
                 continue
-            end = min(end, start + self.MAX_CLIP_DURATION)
-            duration = end - start
+            duration = candidate.end - candidate.start
             if total + duration > budget and selected:
                 continue
-            candidate = clip.model_copy(update={"start": start, "end": end})
             if any(self._overlap(candidate, kept) for kept in selected):
                 continue
             selected.append(candidate)
