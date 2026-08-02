@@ -16,6 +16,7 @@ from src.models.schemas import (
     CandidateDecision,
     ClarificationTurn,
     ExecutionBrief,
+    PlanApprovalException,
     RequirementBrief,
     RequirementSlot,
     RequirementSpec,
@@ -215,14 +216,18 @@ class TaskStore:
         self,
         gate_id: str,
         actor_id: str | None,
+        approval_exceptions: list[PlanApprovalException] | None = None,
     ) -> tuple[AuditableEditPlan, ReviewGate]:
         with self._lock:
-            return self._approve_plan_locked(gate_id, actor_id)
+            return self._approve_plan_locked(
+                gate_id, actor_id, approval_exceptions=approval_exceptions
+            )
 
     def _approve_plan_locked(
         self,
         gate_id: str,
         actor_id: str | None,
+        approval_exceptions: list[PlanApprovalException] | None = None,
     ) -> tuple[AuditableEditPlan, ReviewGate]:
         gate = next((item for item in self._load_gates() if item.id == gate_id), None)
         if gate is None or gate.stage != "edit_plan":
@@ -237,20 +242,38 @@ class TaskStore:
         if plan.id != gate.target_id or plan.status != "draft":
             raise ValueError("Gate 与当前计划版本不匹配")
         approved = plan.model_copy(
-            update={"status": "approved", "approved_at": utc_now()}
+            update={
+                "status": "approved",
+                "approved_at": utc_now(),
+                "approval_exceptions": list(approval_exceptions or []),
+            }
         )
         self.write_model(f"edit_plan_v{approved.version}.json", approved)
         resolved = self.resolve_gate(gate.id, "approved", actor_id)
         self.append_audit(
             AuditEvent(
                 task_id=self.task_id,
-                action="edit_plan_approved",
+                action=(
+                    "edit_plan_approved_with_exception"
+                    if approved.approval_exceptions else "edit_plan_approved"
+                ),
                 subject_type="AuditableEditPlan",
                 subject_id=approved.id,
                 subject_version=approved.version,
                 actor_type="user",
                 actor_id=actor_id,
-                summary=f"用户批准了剪辑计划第 {approved.version} 版。",
+                summary=(
+                    f"用户批准了剪辑计划第 {approved.version} 版，并明确接受当前成片时长低于任务书目标。"
+                    if approved.approval_exceptions
+                    else f"用户批准了剪辑计划第 {approved.version} 版。"
+                ),
+                metadata={
+                    "exception_count": len(approved.approval_exceptions),
+                    "planned_duration": (
+                        approved.approval_exceptions[0].planned_duration
+                        if approved.approval_exceptions else None
+                    ),
+                },
             )
         )
         return approved, resolved

@@ -1,5 +1,7 @@
+import ast
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +9,9 @@ from src.agents.script_agent import ScriptAgent
 from src.agents.executor_agent import ExecutorAgent
 from src.agents.analysis_agent import AnalysisAgent
 from src.agents.candidate_agent import CandidateAgent
+from src.agents.candidate_agent import SpeechBoundaryValidator
+from src.agents.clarification_agent import RequirementClarificationAgent
+from src.agents.alignment_agent import RequirementAlignmentAgent
 from src.agents.requirement_agent import RequirementAgent
 from src.agents.style_agent import StyleRecommendationAgent
 from src.models.schemas import (
@@ -47,6 +52,7 @@ from src.services.plans import EditPlanService
 from src.services.verification import VerificationEngine
 from src.orchestrator import VideoEditOrchestrator
 from src.tools.ffmpeg import FFmpegTool
+from src.tools import llm as llm_tools
 
 
 def test_requirement_compiler_creates_visible_execution_instruction(monkeypatch):
@@ -76,6 +82,657 @@ def test_requirement_compiler_creates_visible_execution_instruction(monkeypatch)
         "target_duration", "focus_keywords", "publish_channel", "high_risk_review"
     }
     assert next(slot for slot in compilation.slots if slot.key == "target_duration").source_type == "llm"
+
+
+def test_embedding_requests_are_split_into_batches_of_ten(monkeypatch):
+    batch_sizes = []
+
+    class FakeEmbeddings:
+        def create(self, *, model, input):
+            batch_sizes.append(len(input))
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(index=index, embedding=[float(value)])
+                    for index, value in enumerate(input)
+                ],
+                usage=None,
+            )
+
+    monkeypatch.setattr(
+        llm_tools,
+        "_embedding_client",
+        SimpleNamespace(embeddings=FakeEmbeddings()),
+    )
+    monkeypatch.setattr(llm_tools, "EMBEDDING_API_KEY", "configured-for-test")
+
+    vectors = llm_tools.embed_texts(list(range(23)))
+
+    assert batch_sizes == [10, 10, 3]
+    assert [vector[0] for vector in vectors] == list(range(23))
+
+
+def test_tool_calling_forces_final_json_and_repairs_truncated_output(monkeypatch):
+    calls = []
+
+    class FakeMessage(SimpleNamespace):
+        def model_dump(self, exclude_none=True):
+            return {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                    for call in (self.tool_calls or [])
+                ],
+            }
+
+    tool_call = SimpleNamespace(
+        id="call-1",
+        function=SimpleNamespace(name="search_evidence", arguments='{"query":"颁奖"}'),
+    )
+    responses = [
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=FakeMessage(content=None, tool_calls=[tool_call]),
+                finish_reason="tool_calls",
+            )],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=FakeMessage(content='{"candidates":[', tool_calls=[]),
+                finish_reason="length",
+            )],
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=FakeMessage(content='{"candidates":[]}', tool_calls=[]),
+                finish_reason="stop",
+            )],
+            usage=None,
+        ),
+    ]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return responses.pop(0)
+
+    monkeypatch.setattr(
+        llm_tools,
+        "_client",
+        SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+
+    result = llm_tools.call_llm_with_tools(
+        system_prompt="返回 JSON",
+        user_message="查找颁奖",
+        tool_definitions=[{"type": "function", "function": {"name": "search_evidence"}}],
+        tool_handlers={"search_evidence": lambda query: {"items": [query]}},
+        max_rounds=2,
+    )
+
+    assert result == {"candidates": []}
+    assert "tools" in calls[0]
+    assert "tools" not in calls[1]
+    assert "tools" not in calls[2]
+
+
+def test_candidate_fallback_suggestions_are_not_exportable():
+    requirement = RequirementItem(description="保留颁奖", priority="should")
+    evidence = EvidenceBuilder.from_transcript([
+        TranscriptSegment(start=0, end=4, text="现在开始颁奖仪式")
+    ])
+    execution = ExecutionBrief(
+        requirement_spec_id="spec-fallback",
+        requirement_spec_version=1,
+        visible_instruction="保留颁奖。",
+    )
+
+    def failed_runner(**_):
+        raise RuntimeError("simulated truncated JSON")
+
+    result = CandidateAgent(
+        llm_runner=failed_runner,
+        retriever=HybridEvidenceRetriever(),
+    ).run(execution, [requirement], evidence, video_duration=10)
+
+    assert result.degraded
+    assert result.candidates
+    assert not result.valid_candidates
+    assert "candidate_ai_unavailable_not_exportable" in result.candidates[0].risk_flags
+
+
+def test_candidate_ending_before_continuation_is_rejected():
+    transcript = [
+        TranscriptSegment(start=0, end=2, text="我们采取了很多办法"),
+        TranscriptSegment(start=2, end=4, text="所以最后顺利完成了活动"),
+    ]
+    candidate = CandidateClip(
+        source_start=0,
+        source_end=2,
+        matched_requirement_ids=["req-1"],
+        citations=[EvidenceCitation(
+            requirement_id="req-1",
+            evidence_id="evidence-1",
+            quote="我们采取了很多办法",
+        )],
+        selection_reason="活动经验",
+        confidence=0.8,
+        suggested_duration=2,
+    )
+
+    errors = SpeechBoundaryValidator().validate(candidate, transcript)
+
+    assert "candidate_ends_mid_sentence" in errors
+
+
+def test_candidate_agent_expands_mid_sentence_candidate_to_complete_expression():
+    requirement = RequirementItem(description="保留活动经验", priority="should")
+    transcript = [
+        TranscriptSegment(start=0, end=2, text="我们采取了很多办法"),
+        TranscriptSegment(start=2, end=4, text="所以最后顺利完成了活动"),
+    ]
+    evidence = EvidenceBuilder.from_transcript(transcript, max_window_seconds=2)
+    execution = ExecutionBrief(
+        requirement_spec_id="spec-boundary",
+        requirement_spec_version=1,
+        visible_instruction="保留完整的活动经验。",
+    )
+
+    def runner(**kwargs):
+        result = kwargs["tool_handlers"]["search_evidence"](
+            requirement_id=requirement.id,
+            query="办法",
+            top_k=1,
+        )
+        item = result["evidence"][0]
+        return {"candidates": [{
+            "source_start": item["source_start"],
+            "source_end": item["source_end"],
+            "matched_requirement_ids": [requirement.id],
+            "citations": [{
+                "requirement_id": requirement.id,
+                "evidence_id": item["evidence_id"],
+                "quote": "我们采取了很多办法",
+                "relation": "direct",
+                "retrieval_score": item["retrieval_score"],
+            }],
+            "selection_reason": "说明活动经验",
+            "confidence": 0.8,
+            "suggested_duration": 2,
+            "risk_flags": [],
+        }]}
+
+    result = CandidateAgent(
+        llm_runner=runner,
+        retriever=HybridEvidenceRetriever(),
+    ).run(
+        execution,
+        [requirement],
+        evidence,
+        video_duration=10,
+        transcript=transcript,
+    )
+
+    assert len(result.valid_candidates) == 1
+    assert result.valid_candidates[0].source_start == 0
+    assert result.valid_candidates[0].source_end == 4
+    assert "candidate_ends_mid_sentence" not in result.valid_candidates[0].risk_flags
+
+
+def test_candidate_agent_batches_requirements_and_builds_citations_in_code():
+    first = RequirementItem(description="保留开幕介绍", priority="should")
+    second = RequirementItem(description="保留颁奖结果", priority="should")
+    transcript = [
+        TranscriptSegment(start=0, end=5, text="主持人宣布活动正式开幕"),
+        TranscriptSegment(start=20, end=25, text="一等奖获得者上台领奖"),
+    ]
+    evidence = EvidenceBuilder.from_transcript(transcript)
+    execution = ExecutionBrief(
+        requirement_spec_id="spec-batched",
+        requirement_spec_version=1,
+        visible_instruction="保留开幕与颁奖。",
+    )
+    calls = []
+
+    def runner(**kwargs):
+        request = ast.literal_eval(kwargs["user_message"])
+        requirement_id = request["requirements"][0]["id"]
+        calls.append({
+            "requirement_count": len(request["requirements"]),
+            "max_tokens": kwargs["max_tokens"],
+            "requirement_id": requirement_id,
+        })
+        result = kwargs["tool_handlers"]["search_evidence"](
+            requirement_id=requirement_id,
+            query=request["requirements"][0]["description"],
+            top_k=1,
+        )
+        item = result["evidence"][0]
+        return {"selections": [{
+            "evidence_id": item["evidence_id"],
+            "source_start": item["source_start"],
+            "source_end": item["source_end"],
+            "reason": "与当前要求直接相关",
+            "confidence": 0.9,
+            # 即使模型额外返回伪造字段，代码也不能采用。
+            "quote": "伪造引文",
+            "retrieval_score": 0.01,
+        }]}
+
+    result = CandidateAgent(
+        llm_runner=runner,
+        retriever=HybridEvidenceRetriever(),
+    ).run(
+        execution,
+        [first, second],
+        evidence,
+        video_duration=30,
+        transcript=transcript,
+    )
+
+    assert len(calls) == 2
+    assert all(call["requirement_count"] == 1 for call in calls)
+    assert all(call["max_tokens"] == CandidateAgent.BATCH_MAX_TOKENS for call in calls)
+    assert {call["requirement_id"] for call in calls} == {first.id, second.id}
+    assert len(result.valid_candidates) == 2
+    assert {citation.quote for item in result.valid_candidates for citation in item.citations} == {
+        "主持人宣布活动正式开幕",
+        "一等奖获得者上台领奖",
+    }
+    assert all(
+        citation.retrieval_score == 1.0
+        for item in result.valid_candidates
+        for citation in item.citations
+    )
+
+
+def test_candidate_agent_isolates_failed_requirement_batch():
+    failed = RequirementItem(description="保留不存在的领导讲话", priority="should")
+    successful = RequirementItem(description="保留颁奖结果", priority="should")
+    transcript = [
+        TranscriptSegment(start=0, end=4, text="暖场画面"),
+        TranscriptSegment(start=20, end=25, text="一等奖获得者上台领奖"),
+    ]
+    evidence = EvidenceBuilder.from_transcript(transcript)
+    execution = ExecutionBrief(
+        requirement_spec_id="spec-isolation",
+        requirement_spec_version=1,
+        visible_instruction="分别分析两个要求。",
+    )
+    attempts = {failed.id: 0, successful.id: 0}
+
+    def runner(**kwargs):
+        request = ast.literal_eval(kwargs["user_message"])
+        requirement_id = request["requirements"][0]["id"]
+        attempts[requirement_id] += 1
+        if requirement_id == failed.id:
+            raise RuntimeError("simulated batch truncation")
+        result = kwargs["tool_handlers"]["search_evidence"](
+            requirement_id=requirement_id,
+            query="颁奖",
+            top_k=1,
+        )
+        item = result["evidence"][0]
+        return {"selections": [{
+            "evidence_id": item["evidence_id"],
+            "source_start": item["source_start"],
+            "source_end": item["source_end"],
+            "reason": "颁奖结果",
+            "confidence": 0.9,
+        }]}
+
+    result = CandidateAgent(
+        llm_runner=runner,
+        retriever=HybridEvidenceRetriever(),
+    ).run(
+        execution,
+        [failed, successful],
+        evidence,
+        video_duration=30,
+        transcript=transcript,
+    )
+
+    assert attempts[failed.id] == CandidateAgent.BATCH_ATTEMPTS
+    assert attempts[successful.id] == 1
+    assert result.degraded
+    assert result.failed_requirement_ids == [failed.id]
+    assert any(
+        successful.id in candidate.matched_requirement_ids
+        for candidate in result.valid_candidates
+    )
+    assert all(
+        "candidate_generation_fallback" not in candidate.risk_flags
+        for candidate in result.valid_candidates
+    )
+
+
+def test_plan_validation_blocks_duration_far_below_taskbook():
+    spec = RequirementSpec(
+        brief_id="brief-duration-gate",
+        target_duration=210,
+        duration_tolerance=21,
+        status="confirmed",
+    )
+    delivery = DeliverySpec(
+        requirement_spec_id=spec.id,
+        requirement_spec_version=spec.version,
+        target_duration=210,
+        duration_tolerance=21,
+        need_subtitles=False,
+    )
+    script = EditScript(estimated_duration=59, operations=[])
+    plan = AuditableEditPlan(
+        requirement_spec_id=spec.id,
+        requirement_spec_version=spec.version,
+        delivery_spec=delivery,
+        execution_script=script,
+        estimated_duration=59,
+    )
+
+    validation = EditPlanService().validate(
+        plan,
+        spec,
+        candidates=[],
+        video_duration=330,
+    )
+
+    assert not validation.valid
+    assert "plan_duration_too_short" in validation.errors
+
+
+def test_empty_focus_form_value_remains_an_unresolved_slot_for_ai_analysis(monkeypatch):
+    agent = RequirementAgent()
+    parsed = VideoRequirement(
+        target_duration=180,
+        video_type="general",
+        style="formal",
+        focus_keywords=[],
+        need_subtitles=True,
+    )
+    monkeypatch.setattr(agent, "run", lambda _: parsed)
+
+    compilation = agent.compile(
+        "制作一条学校活动回顾视频",
+        scenario="school",
+        overrides={"focus_keywords": []},
+    )
+
+    focus_slot = next(slot for slot in compilation.slots if slot.key == "focus_keywords")
+    assert focus_slot.status == "missing"
+    assert focus_slot.question is None
+
+
+def test_clarification_agent_generates_explainable_questions_only_for_allowed_slots():
+    spec = RequirementSpec(
+        brief_id="brief-ai-questions",
+        target_duration=180,
+        requirements=[RequirementItem(description="保留活动主题", priority="should")],
+    )
+    slots = [
+        RequirementSlot(
+            key="target_duration",
+            label="目标时长",
+            value=180,
+            status="confirmed",
+            source_type="form",
+        ),
+        RequirementSlot(
+            key="focus_keywords",
+            label="重点内容",
+            status="missing",
+        ),
+        RequirementSlot(
+            key="high_risk_review",
+            label="高风险信息核对",
+            status="unknown",
+            risk_level="high",
+        ),
+    ]
+
+    def fake_llm(**kwargs):
+        request = __import__("json").loads(kwargs["user_message"])
+        assert {item["key"] for item in request["allowed_slots"]} == {
+            "focus_keywords", "high_risk_review"
+        }
+        return {"questions": [
+            {
+                "slot_key": "target_duration",
+                "question": "已经确认的时长还要改吗？",
+                "reason": "不应通过校验",
+                "impact": "不应展示",
+            },
+            {
+                "slot_key": "focus_keywords",
+                "question": "这次活动中，有没有必须出现的人物或环节？",
+                "reason": "当前只说明要保留活动主题，没有指出必须出现的内容。",
+                "impact": "会影响候选片段筛选和最终逐项验收。",
+                "answer_hint": "例如：校长致辞、一等奖颁奖",
+            },
+            {
+                "slot_key": "unknown_slot",
+                "question": "无效问题是什么？",
+                "reason": "不应通过校验",
+                "impact": "不应展示",
+            },
+        ]}
+
+    agent = RequirementClarificationAgent(llm_runner=fake_llm)
+    questions = agent.run(
+        raw_text="制作一条三分钟学校活动回顾",
+        spec=spec,
+        slots=slots,
+        scenario="school",
+    )
+    revised_spec, revised_slots = agent.apply_questions(spec, slots, questions)
+
+    assert [item.slot_key for item in questions] == ["focus_keywords"]
+    assert revised_spec.open_questions == [questions[0].question]
+    focus_slot = next(item for item in revised_slots if item.key == "focus_keywords")
+    assert focus_slot.question_reason == questions[0].reason
+    assert focus_slot.question_impact == questions[0].impact
+    assert focus_slot.question_source.startswith("clarification-agent:")
+
+
+def test_alignment_agent_grounds_suggestion_in_allowed_material_evidence():
+    spec = RequirementSpec(
+        brief_id="brief-alignment",
+        target_duration=120,
+        requirements=[RequirementItem(description="制作活动回顾", priority="should")],
+    )
+    transcript = [
+        TranscriptSegment(start=0, end=4, text="参加主题党日活动让我印象很深"),
+        TranscriptSegment(start=4, end=8, text="希望以后增加更多实践环节"),
+    ]
+    analysis = ContentAnalysis(
+        video_duration=180,
+        transcript=transcript,
+        evidence=EvidenceBuilder.from_transcript(transcript),
+        summary="主题党日活动参与感受访谈",
+    )
+    allowed_id = analysis.evidence[0].id
+
+    def fake_llm(**kwargs):
+        request = __import__("json").loads(kwargs["user_message"])
+        assert request["material_evidence"][0]["evidence_id"] == allowed_id
+        return {
+            "alignment_status": "too_vague",
+            "confidence": 0.91,
+            "material_summary": "素材是一段主题党日活动参与感受访谈",
+            "detected_topics": ["参与感受", "改进建议"],
+            "rationale": "原任务只写活动回顾，没有指出访谈主题。",
+            "suggested_requirement_text": "剪成两分钟主题党日访谈摘要，保留完整表达。",
+            "suggested_purpose": "主题党日活动访谈摘要",
+            "suggested_video_type": "meeting",
+            "suggested_style": "formal",
+            "suggested_target_duration": 120,
+            "suggested_focus_items": ["参与活动的感受", "对活动的改进建议"],
+            "supporting_evidence_ids": [allowed_id, "invented-evidence"],
+        }
+
+    proposal = RequirementAlignmentAgent(llm_runner=fake_llm).run(
+        raw_text="帮我剪一个活动回顾",
+        spec=spec,
+        analysis=analysis,
+        scenario="school",
+    )
+
+    assert proposal.requires_user_decision
+    assert proposal.supporting_evidence_ids == [allowed_id]
+    assert proposal.suggested_focus_items == ["参与活动的感受", "对活动的改进建议"]
+
+
+def test_alignment_decision_revises_taskbook_and_reuses_cached_transcript(
+    tmp_path: Path,
+    monkeypatch,
+):
+    brief = RequirementBrief(raw_text="帮我剪一个活动回顾", scenario="school")
+    initial_item = RequirementItem(description="制作活动回顾", priority="should")
+    spec = RequirementSpec(
+        brief_id=brief.id,
+        target_duration=120,
+        requirements=[initial_item],
+    )
+    execution = ExecutionBrief(
+        requirement_spec_id=spec.id,
+        requirement_spec_version=1,
+        visible_instruction="制作活动回顾。",
+        included_requirement_ids=[initial_item.id],
+    )
+    legacy = VideoRequirement(
+        target_duration=120,
+        video_type="general",
+        style="formal",
+        focus_keywords=[],
+    )
+    slots = RequirementAgent._build_slots(
+        brief.raw_text,
+        spec,
+        scenario="school",
+        overrides={"target_duration": 120},
+        manual_required=False,
+    )
+    compilation = RequirementCompilation(
+        brief=brief,
+        spec=spec,
+        execution_brief=execution,
+        legacy_requirement=legacy,
+        slots=slots,
+    )
+    transcript = [
+        TranscriptSegment(start=0, end=4, text="参加主题党日活动让我印象很深"),
+        TranscriptSegment(start=4, end=8, text="希望以后增加更多实践环节"),
+    ]
+    material_analysis = ContentAnalysis(
+        video_duration=180,
+        transcript=transcript,
+        evidence=EvidenceBuilder.from_transcript(transcript),
+        summary="主题党日活动参与感受访谈",
+    )
+
+    class FakeRequirementAgent:
+        def compile(self, *args, **kwargs):
+            return compilation
+
+    class FakeAnalysisAgent:
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, *args, **kwargs):
+            self.calls += 1
+            return material_analysis
+
+    class EmptyCandidateResult:
+        candidates = []
+        valid_ids = []
+        valid_candidates = []
+        retrieval_trace = {}
+        missing_must_requirement_ids = []
+        degraded = False
+        failure_reason = None
+
+    class FakeCandidateAgent:
+        def run(self, *args, **kwargs):
+            return EmptyCandidateResult()
+
+    def alignment_llm(**_):
+        return {
+            "alignment_status": "too_vague",
+            "confidence": 0.9,
+            "material_summary": "素材是一段主题党日活动参与感受访谈",
+            "detected_topics": ["参与感受", "改进建议"],
+            "rationale": "初始要求没有说明访谈主题。",
+            "suggested_requirement_text": "剪成两分钟主题党日访谈摘要，保留完整表达。",
+            "suggested_purpose": "主题党日活动访谈摘要",
+            "suggested_video_type": "meeting",
+            "suggested_style": "formal",
+            "suggested_target_duration": 120,
+            "suggested_focus_items": ["参与活动的感受", "对活动的改进建议"],
+            "supporting_evidence_ids": [material_analysis.evidence[0].id],
+        }
+
+    analysis_agent = FakeAnalysisAgent()
+    orchestrator = VideoEditOrchestrator.__new__(VideoEditOrchestrator)
+    orchestrator.agent1 = FakeRequirementAgent()
+    orchestrator.clarification_agent = RequirementClarificationAgent(
+        llm_runner=lambda **_: {"questions": []}
+    )
+    orchestrator.alignment_agent = RequirementAlignmentAgent(llm_runner=alignment_llm)
+    orchestrator.agent2 = analysis_agent
+    orchestrator.candidate_agent = FakeCandidateAgent()
+    orchestrator.style_agent = None
+    orchestrator.agent3 = ScriptAgent()
+    orchestrator.agent4 = ExecutorAgent()
+    orchestrator.plan_service = EditPlanService()
+    orchestrator.clarification_service = RequirementClarificationService()
+    orchestrator.status = PipelineStatus(step="init")
+    orchestrator.task_dir = None
+    orchestrator.store = None
+    orchestrator.state_machine = None
+    orchestrator.preview_paths = {}
+    orchestrator.video_path = None
+    orchestrator._render_lock = __import__("threading").Lock()
+    monkeypatch.setattr("src.orchestrator.OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(
+        "src.orchestrator.FFmpegTool.get_video_info",
+        lambda _: {"duration": 180, "has_audio": True, "has_video": True},
+    )
+
+    created = orchestrator.create_requirement_draft("input.mp4", brief.raw_text)
+
+    assert created.alignment_proposal.requires_user_decision
+    assert analysis_agent.calls == 1
+    assert (orchestrator.task_dir / "material_analysis.json").exists()
+    assert orchestrator.status.task_snapshot.state == "requirement_draft"
+
+    with pytest.raises(ValueError, match="请先处理素材与需求对齐建议"):
+        orchestrator.confirm_requirement_draft(
+            orchestrator.status.requirement_gate.id,
+            actor_id="tester",
+        )
+
+    revised = orchestrator.resolve_material_alignment("adopt", actor_id="tester")
+
+    assert revised.spec.version == 2
+    assert revised.spec.purpose == "主题党日活动访谈摘要"
+    assert [item.description for item in revised.spec.requirements] == [
+        "参与活动的感受",
+        "对活动的改进建议",
+        "人物发言或问答必须保留完整，不在表达中途截断",
+    ]
+    assert (orchestrator.task_dir / "material_alignment_decision.json").exists()
+
+    orchestrator.confirm_requirement_draft(orchestrator.status.requirement_gate.id, "tester")
+    orchestrator.analyze_confirmed_requirement("input.mp4")
+
+    assert analysis_agent.calls == 1
 
 
 def test_multi_turn_clarification_updates_only_answered_slots_and_protects_confirmed_values():
@@ -154,6 +811,85 @@ def test_multi_turn_clarification_updates_only_answered_slots_and_protects_confi
     target_slot = next(slot for slot in conflict_slots if slot.key == "target_duration")
     assert target_slot.status == "conflict"
     assert "已有确认值" in target_slot.question
+
+
+def test_ignored_clarifications_do_not_become_fake_requirements():
+    spec = RequirementSpec(
+        brief_id="brief-ignore",
+        target_duration=180,
+        requirements=[RequirementItem(description="保留活动主题内容", priority="should")],
+        open_questions=["重点是什么？", "哪些实体需要核对？"],
+    )
+    execution = ExecutionBrief(
+        requirement_spec_id=spec.id,
+        requirement_spec_version=1,
+        visible_instruction="制作活动回顾。",
+    )
+    slots = [
+        RequirementSlot(
+            key="focus_keywords",
+            label="重点内容",
+            status="missing",
+            question="重点是什么？",
+        ),
+        RequirementSlot(
+            key="high_risk_review",
+            label="高风险核对",
+            status="unknown",
+            question="哪些实体需要核对？",
+        ),
+    ]
+
+    revised, _, revised_slots, turn = RequirementClarificationService().apply(
+        task_id="task-ignore",
+        spec=spec,
+        execution=execution,
+        slots=slots,
+        answers={
+            "focus_keywords": "暂不确定",
+            "high_risk_review": "暂不确定",
+        },
+    )
+
+    descriptions = [item.description for item in revised.requirements]
+    assert not any("暂不确定" in description for description in descriptions)
+    assert any("必须人工复核" in description for description in descriptions)
+    assert all(slot.status == "unknown" for slot in revised_slots)
+    assert turn.answers == {
+        "focus_keywords": "暂时忽略",
+        "high_risk_review": "暂时忽略",
+    }
+
+
+def test_compliance_requirement_is_not_used_as_clip_search_target():
+    content = RequirementItem(description="保留主题发言", category="content", priority="should")
+    compliance = RequirementItem(
+        description="姓名和职务必须人工复核",
+        category="compliance",
+        priority="should",
+        status="needs_confirmation",
+    )
+    evidence = EvidenceBuilder.from_transcript([
+        TranscriptSegment(start=0, end=4, text="今天介绍活动主题")
+    ])
+    execution = ExecutionBrief(
+        requirement_spec_id="spec-compliance",
+        requirement_spec_version=1,
+        visible_instruction="制作活动回顾。",
+    )
+    seen_requirements = []
+
+    def runner(**kwargs):
+        request = ast.literal_eval(kwargs["user_message"])
+        seen_requirements.extend(item["id"] for item in request["requirements"])
+        return {"candidates": []}
+
+    CandidateAgent(
+        llm_runner=runner,
+        retriever=HybridEvidenceRetriever(),
+    ).run(execution, [content, compliance], evidence, video_duration=10)
+
+    assert seen_requirements == [content.id]
 
 
 def test_task_state_machine_rejects_illegal_transitions_and_recovers(tmp_path: Path):
@@ -247,7 +983,7 @@ def test_requirement_compiler_failure_creates_visible_manual_draft(monkeypatch):
     assert compilation.legacy_requirement.focus_keywords == []
     assert not compilation.legacy_requirement.need_subtitles
     assert compilation.warnings
-    assert "请核对目标时长" in compilation.spec.open_questions[0]
+    assert compilation.spec.open_questions == []
     assert compilation.execution_brief.visible_instruction.startswith("注意：AI 需求解析失败")
 
 
@@ -711,6 +1447,40 @@ def test_hybrid_retrieval_uses_dense_semantics_when_words_do_not_match():
     assert matches[0][0].content == "校长发表讲话"
 
 
+def test_hybrid_retrieval_disables_dense_channel_after_first_service_failure():
+    evidence = EvidenceBuilder.from_transcript([
+        TranscriptSegment(start=0, end=3, text="运动会开幕式"),
+    ])
+    calls = 0
+
+    def failed_embeddings(_):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("embedding service unavailable")
+
+    retriever = HybridEvidenceRetriever(embedding_fn=failed_embeddings)
+    assert retriever.search("开幕式", evidence, top_k=1)
+    assert retriever.search("运动会", evidence, top_k=1)
+    assert calls == 1
+    assert retriever.dense is None
+
+
+def test_hybrid_retrieval_rejects_non_finite_embedding_values():
+    evidence = EvidenceBuilder.from_transcript([
+        TranscriptSegment(start=0, end=3, text="运动会开幕式"),
+    ])
+
+    retriever = HybridEvidenceRetriever(
+        embedding_fn=lambda texts: [[float("nan"), 1.0] for _ in texts]
+    )
+
+    matches = retriever.search("开幕式", evidence, top_k=1)
+
+    assert matches
+    assert matches[0][0].content == "运动会开幕式"
+    assert retriever.dense is None
+
+
 def test_candidate_rejects_existing_evidence_not_returned_by_tool():
     requirement = RequirementItem(description="保留颁奖", priority="should")
     evidence = EvidenceBuilder.from_transcript(
@@ -885,7 +1655,7 @@ def test_prepare_writes_recoverable_task_artifacts(tmp_path: Path, monkeypatch):
     )
     spec = RequirementSpec(
         brief_id=brief.id,
-        target_duration=30,
+        target_duration=3,
         requirements=[requirement_item],
         open_questions=[],
     )
@@ -923,7 +1693,7 @@ def test_prepare_writes_recoverable_task_artifacts(tmp_path: Path, monkeypatch):
         def __init__(self, value):
             self.value = value
 
-        def run(self, *args):
+        def run(self, *args, **kwargs):
             return self.value
 
     class FakeRequirementAgent:
@@ -971,7 +1741,7 @@ def test_prepare_writes_recoverable_task_artifacts(tmp_path: Path, monkeypatch):
     assert (orchestrator.task_dir / "execution_result.json").exists()
     assert (orchestrator.task_dir / "verification_report.json").exists()
     assert (orchestrator.task_dir / "delivery_report.json").exists()
-    assert orchestrator.status.task_snapshot.state == "awaiting_delivery_resolution"
+    assert orchestrator.status.task_snapshot.state == "succeeded"
 
 
 def test_analysis_chunking_and_deduplication_are_time_based():

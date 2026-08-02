@@ -197,10 +197,9 @@ class RequirementAgent(BaseAgent):
         requirement = self._apply_overrides(requirement, overrides)
         domain = get_domain_config(scenario)
         items = self._build_requirement_items(raw_text, requirement)
-        questions = self._build_open_questions(raw_text, items, scenario)
-        if mode == "manual_required":
-            questions.insert(0, "请核对目标时长、风格、重点内容和字幕设置，并说明是否按当前草稿继续。")
-            questions = questions[:5]
+        # 是否需要追问、具体问什么，由独立的澄清 Agent 在任务书草稿完成后判断。
+        # 编译器不再通过固定模板替 AI 提问。
+        questions: list[str] = []
         spec = RequirementSpec(
             brief_id=brief.id,
             purpose=self._infer_purpose(raw_text, scenario),
@@ -299,31 +298,6 @@ class RequirementAgent(BaseAgent):
         return items
 
     @staticmethod
-    def _build_open_questions(
-        raw_text: str,
-        items: list[RequirementItem],
-        scenario: str,
-    ) -> list[str]:
-        questions: list[str] = []
-        domain = get_domain_config(scenario)
-        if not any(item.priority == "must" for item in items):
-            questions.append("是否有必须出现的人物、环节、奖项、产品或组织名称？")
-        if not re.search(r"(发布|公众号|抖音|视频号|内网|汇报|宣传)", raw_text):
-            questions.append("成片将发布到哪里，主要给谁看？")
-        risk_terms = [*domain["must_check"], *domain["privacy"]]
-        if not any(term in raw_text for term in risk_terms) and not re.search(
-            r"(人名|姓名|职务|奖项|确认|隐私|未成年人|产品名|合作伙伴)", raw_text
-        ):
-            questions.append(
-                "是否涉及需要人工核对的"
-                + "、".join(domain["must_check"])
-                + "，或需要注意的"
-                + "、".join(domain["privacy"])
-                + "？"
-            )
-        return questions[:5]
-
-    @staticmethod
     def _build_slots(
         raw_text: str,
         spec: RequirementSpec,
@@ -335,7 +309,8 @@ class RequirementAgent(BaseAgent):
         """将任务书投影为带来源的槽位，后续澄清只补丁这些槽位。"""
         explicit = overrides or {}
         publish_match = re.search(r"(公众号|抖音|视频号|内网|汇报|宣传|官网)", raw_text)
-        focus_explicit = "focus_keywords" in explicit
+        # UI 会始终提交 focus_keywords；空列表只代表用户尚未填写，不能视为已确认。
+        focus_explicit = bool(explicit.get("focus_keywords"))
         duration_explicit = "target_duration" in explicit
         style_explicit = "style" in explicit
         domain = get_domain_config(scenario)
@@ -382,7 +357,7 @@ class RequirementAgent(BaseAgent):
                 status=("confirmed" if focus_explicit else "missing"),
                 source_type="form" if focus_explicit else "llm",
                 source_ref=spec.id,
-                question=None if focus_explicit else "请补充必须或优先保留的人物、环节和奖项。",
+                question=None,
             ),
             RequirementSlot(
                 key="publish_channel",
@@ -391,7 +366,7 @@ class RequirementAgent(BaseAgent):
                 status="confirmed" if publish_match else "missing",
                 source_type="user_input",
                 source_ref="raw_text",
-                question=None if publish_match else "成片将发布到哪里？",
+                question=None,
             ),
             RequirementSlot(
                 key="high_risk_review",
@@ -404,7 +379,7 @@ class RequirementAgent(BaseAgent):
                 risk_level="high",
                 source_type="domain_config",
                 source_ref=scenario,
-                question="请说明本次涉及哪些姓名、职务、奖项、产品或隐私信息。",
+                question=None,
             ),
         ]
 
@@ -418,22 +393,40 @@ class RequirementAgent(BaseAgent):
 
     @staticmethod
     def _build_visible_instruction(spec: RequirementSpec) -> str:
-        priority_names = {"must": "必须", "should": "应该", "optional": "可选", "prohibited": "禁止"}
+        priority_names = {
+            "must": "必须保留",
+            "should": "建议保留",
+            "optional": "可有可无",
+            "prohibited": "禁止出现",
+        }
+        style_names = {
+            "formal": "正式稳重",
+            "exciting": "精彩有节奏",
+            "warm": "温馨自然",
+            "funny": "轻松活泼",
+        }
         item_lines = [
-            f"- [{priority_names[item.priority]}] {item.description}"
-            + (f"；验收：{item.acceptance_rule}" if item.acceptance_rule else "")
+            f"- **{priority_names[item.priority]}：** {item.description}"
             for item in spec.requirements
         ]
-        subtitle = "需要字幕" if spec.need_subtitles else "不烧录字幕"
-        bgm = "可使用用户提供且已授权的 BGM" if spec.need_bgm else "不自动添加 BGM"
+        subtitle = "生成中文字幕，并允许你在出片前修改" if spec.need_subtitles else "不生成中文字幕"
+        bgm = "只使用你上传并确认有权使用的背景音乐" if spec.need_bgm else "不自动添加背景音乐"
+        style = style_names.get(spec.style, "根据活动内容自然处理")
         return "\n".join(
             [
-                f"本次任务用于：{spec.purpose}。受众：{spec.audience}。",
-                f"目标成片时长 {spec.target_duration:.0f} 秒，允许误差 ±{spec.duration_tolerance:.0f} 秒；风格为 {spec.style}。",
-                f"交付规则：{subtitle}；{bgm}；输出 MP4。",
-                "内容要求：",
+                "1. **理解素材：** 先把视频语音转成带时间位置的文字，定位与任务书有关的内容。",
+                "2. **筛选候选：** 按照下面的内容要求寻找片段；不会仅凭一个关键词直接决定入选。",
                 *item_lines,
-                "分析时只允许引用已确认的转录片段和用户人工标注；人名、职务、奖项和其他高风险信息必须标记为人工确认。",
+                "3. **给出依据：** 每个候选片段都会展示原视频时间、字幕原文、对应要求和推荐理由，方便你核对。",
+                "4. **标记风险：** 姓名、职务、奖项、产品名称和隐私信息不会被当作已确认事实，会提醒你人工检查。",
+                "5. **等待审核：** AI 只生成候选片段和粗剪顺序；你确认保留、删除、字幕和顺序后，系统才生成成片。",
+                "",
+                "**本次输出约定：**",
+                f"- 目标成片时长 {spec.target_duration:.0f} 秒，允许前后相差 {spec.duration_tolerance:.0f} 秒",
+                f"- 画面整体感觉：{style}",
+                f"- 字幕：{subtitle}",
+                f"- 音乐：{bgm}",
+                "- 文件格式：MP4",
             ]
         )
 

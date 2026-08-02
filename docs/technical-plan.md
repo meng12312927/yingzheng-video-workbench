@@ -109,7 +109,7 @@ RequirementCompiler EvidenceRetriever CandidateAnalyzer ApprovalService
 - 在执行前后建立可追溯记录。
 - 识别失败原因并决定失败、降级或等待人工处理。
 
-Harness 不是自由对话式多 Agent 系统。各组件通过明确的数据契约协作，Orchestrator 仍是唯一流程控制者。
+Harness 不是自由对话式多 Agent 系统。各组件通过明确的数据契约协作，Orchestrator 仍是唯一流程控制者。`RequirementAlignmentAgent` 只比较素材事实与任务书并产生建议，是否写入任务书始终由用户决定。
 
 ### 3.2 分阶段部署形态
 
@@ -181,7 +181,7 @@ class RequirementSpec(BaseModel):
 
 规则：
 
-- 单次最多返回 5 个澄清问题。
+- 独立 `RequirementClarificationAgent` 单次最多返回 3 个澄清问题，也可以返回空数组。
 - `confirmed` 版本不可原地修改；修改必须生成新版本。
 - `must` 和 `prohibited` 项必须具有可执行的验收规则或明确标记人工验收。
 
@@ -193,10 +193,22 @@ class RequirementSpec(BaseModel):
 class RequirementSlot(BaseModel):
     key: str
     value: Any | None = None
-    status: Literal["missing", "suggested", "needs_confirmation", "confirmed", "conflicted"]
-    source_message_ids: list[str] = []
-    confidence: float | None = None
-    sensitive: bool = False
+    status: Literal["missing", "inferred", "confirmed", "conflict", "unknown"]
+    source_type: str
+    source_ref: str | None
+    risk_level: Literal["low", "medium", "high"]
+    question: str | None
+    question_reason: str | None
+    question_impact: str | None
+    answer_hint: str | None
+    question_source: str | None
+
+class ClarificationQuestion(BaseModel):
+    slot_key: str
+    question: str
+    reason: str
+    impact: str
+    answer_hint: str | None
 
 class ClarificationTurn(BaseModel):
     id: str
@@ -208,7 +220,7 @@ class ClarificationTurn(BaseModel):
     created_at: datetime
 ```
 
-`RequirementCompiler` 每轮读取当前槽位快照、最近必要消息和场景规则，输出槽位补丁而不是整份自由文本任务书。合并器使用确定性规则保护 `confirmed` 值：新模型建议只能形成 `conflicted` 或 `needs_confirmation`，不能覆盖用户确认值。任务书确认时将有效槽位确定性编译为 `RequirementSpec`；高风险槽位未确认或仍有冲突时不能通过 Gate。
+`RequirementCompiler` 先生成任务书草稿和槽位快照；`RequirementClarificationAgent` 再读取原始需求、当前任务书和 Harness 提供的允许槽位，输出最多 3 个 `ClarificationQuestion`。模型不能创建任意槽位或直接写入任务书，未知槽位、重复问题、已确认槽位和非法结构由代码丢弃。`RequirementClarificationService` 只把用户回答作为槽位补丁合并，并保护 `confirmed` 值不被静默覆盖。用户选择忽略时记录为 `unknown`，不生成虚假需求事实。
 
 ### 4.2.2 ExecutionBrief：用户可见的执行说明
 
@@ -577,13 +589,13 @@ class TaskEventRecord(BaseModel):
 避免使用一条超级 Prompt：
 
 1. `raw_text + 场景规则 → RequirementSlot[] + RequirementSpec draft`。
-2. `SlotCompletenessChecker` 确定缺失、冲突和高风险槽位；只有必要时进入 `awaiting_requirement_clarification`。
-3. 每轮 `用户回答 → 槽位补丁 → 确定性合并 → 新任务书草稿`，已确认值不被模型静默覆盖。
-4. 用户编辑任务书、解决所有阻塞槽位并批准需求版本。
-5. `RequirementSpec → ExecutionBrief draft`；用户在同一次需求确认中查看并固化该说明，不增加独立审批点。
-6. `search_evidence` / `expand_evidence` 工具调用 → 受限证据集 → `CandidateClip[]`。
-7. `EvidenceValidator`、Schema 与领域规则校验。
-8. 系统创建下一阶段可用的版本化输入。风格推荐只在用户启用样式配置时运行，且模型只能从 `StyleCatalog` 选择已有 ID。
+2. 本地 Whisper 生成 `material_analysis.json`、转录和证据窗口；`RequirementAlignmentAgent` 比较素材与初步任务书。
+3. 若结果为 `too_vague` 或 `mismatch`，用户选择采用、修改后采用或保持原任务书；决定生成新版本和审计事件，模型建议不能直接越过该操作。
+4. `RequirementClarificationAgent` 根据决定后的任务书，从 Harness 允许的槽位中动态生成 0–3 个带原因和影响说明的问题。
+5. 每轮 `用户回答/忽略 → 槽位补丁 → 确定性合并 → 新任务书草稿`，已确认值不被模型静默覆盖。
+6. 用户编辑任务书、解决所有阻塞槽位并批准需求版本。
+7. 候选阶段复用预分析转录，执行 `search_evidence` / `expand_evidence` → 受限证据集 → `CandidateClip[]`，不得重复运行 Whisper。
+8. `EvidenceValidator`、Schema 与领域规则校验后创建下一阶段版本化输入；风格推荐只能从 `StyleCatalog` 选择已有 ID。
 
 ### 6.2 场景知识包
 
@@ -612,7 +624,7 @@ DOMAIN_CONFIG = {
 - 未知优先级、非法时长或重复 ID 直接拒绝。
 - 模型不得将未经用户确认的人名和职务标为已确认。
 - 模型调用失败时保留用户原始需求并进入人工编辑，不静默生成默认正式需求。
-- 人工降级草稿必须标记 `RequirementCompilation.mode = manual_required`，显示失败警告和待确认问题，并把降级模式写入任务清单与业务审计；只有用户补充说明并批准 Gate 后才能进入证据分析。
+- 人工降级草稿必须标记 `RequirementCompilation.mode = manual_required`，显示失败警告并把降级模式写入任务清单与业务审计；用户可直接编辑草稿后批准 Gate。澄清 Agent 失败时单独记录 `ai_failed`，不得回退到伪装成 AI 的固定问题。
 - 将转录、用户需求和工具返回结果作为不可信数据包，用明确分隔符传入模型；它们不能覆盖系统指令或工具权限。
 - 每次调用记录模型、提示模板版本、工具调用参数、检索证据 ID、耗时、token 和结构化错误；不记录隐藏推理。
 
@@ -644,17 +656,21 @@ MVP 优先使用本地 BM25、FAISS/NumPy 和 RRF。`EvidenceIndex` 定义 `inde
 
 ### 7.3 受限工具调用与引用校验
 
-1. 候选模型不能收到全文转录。它只能通过 `search_evidence(requirement_id, query, top_k)` 获得受限证据，并可调用 `expand_evidence(evidence_id)` 请求相邻上下文。
-2. LLM 最终输出结构化候选及 `EvidenceCitation(requirement_id, evidence_id, quote, relation)`；`quote` 必须复制工具返回证据中的原文，不能改写实体字符。
-3. `EvidenceValidator` 对原文和引文执行 Unicode NFKC 归一化，并忽略空白与受控标点差异，然后要求剩余引用仍是证据原文的连续子串；人名、职务、奖项和产品实体的字符不得模糊通过。
-4. 验证需求 ID、证据 ID、当前批准范围、候选源时间、证据时间和素材边界。任何失败均标记 `invalid_evidence`，不得参与自动选段。
-5. 语义相关性来自召回、重排和受限 LLM，只是建议；确定性代码不声称证明两个不同表述语义等价。
+1. 候选模型不能收到全文转录，也不能一次处理整份任务书。Harness 对每条可选内容要求建立独立批次；该批次的 `search_evidence(requirement_id, query, top_k)` 只接受当前需求 ID，并可调用 `expand_evidence(evidence_id)` 请求已召回证据的相邻上下文。
+2. 每批最多返回 2 个紧凑选择：`evidence_id`、`source_start`、`source_end`、简短 `reason` 和 `confidence`。单批输出预算固定为 1000 tokens，禁止模型返回引文、需求 ID、检索分数或字幕全文，从结构上避免整份候选 JSON 撞到模型输出上限。
+3. Harness 根据当前批次和证据索引确定性生成 `EvidenceCitation(requirement_id, evidence_id, quote, relation, retrieval_score)`；即使模型额外输出同名字段也一律忽略，因此引文和需求关联不是可伪造的自由字段。
+4. 单批失败最多重试 1 次；仍失败时只把该项检索建议标记为不可导出的降级候选，其他成功批次继续进入审核。任务产物记录 `failed_requirement_ids`，页面用用户可读的需求描述提示局部失败。
+5. 代码先把模型时间吸附到完整 ASR 段边界，并向前后补齐明显的连接词、因果关系和同一说话人承接句；随后合并跨需求重复候选，同时保留每项需求的独立引用。
+6. `EvidenceValidator` 对代码生成的引文和证据执行 Unicode NFKC 归一化，并忽略空白与受控标点差异，然后要求剩余引用仍是证据原文的连续子串；人名、职务、奖项和产品实体的字符不得模糊通过。
+7. 验证需求 ID、证据 ID、当前批准范围、候选源时间、证据时间和素材边界。任何失败均不得参与自动选段。语义相关性来自召回、重排和受限 LLM，只是建议；确定性代码不声称证明两个不同表述语义等价。
 
 该规则与 PRD 保持一致，明确取消“编辑距离 5% 即自动通过”的宽松方案，避免短中文实体只差一个字时产生错误引用。
 
 ### 7.4 候选规划
 
 去重、重叠、最短片段、`must` 覆盖和总时长由确定性代码处理；`must` 内容不因普通预算算法静默删除。用户在电脑端审核候选、证据、风险和粗剪时间线，可保留、删除、缩短、延长、替换、排序或手动添加片段；批准集合后才渲染。现有关键词加权只作为一路召回，不再作为需求覆盖、最终排序或候选理由的唯一依据。
+
+若计划仅有 `plan_duration_too_short` 一项错误，页面显示“接受当前时长并生成”和“从原素材补入片段”两条路径。前者生成绑定计划版本、预计时长、任务书最低时长和操作者的 `PlanApprovalException`；后端仍拒绝缺失 `must`、未知证据、越界片段等其他错误。交付验收只在实际成片时长与已批准短版计划基本一致时认可该例外，避免用一次授权掩盖新的渲染偏差。后者在审核区直接展示原素材播放器，用户以双滑块拖动选择片段范围并勾选对应任务书要求；前端保存结构化补片区间，后端据此生成 `user_annotation` 证据并重建计划版本，用户不需要手写起止秒数或内部要求 ID。
 
 ### 7.5 工具注册与治理
 
@@ -714,7 +730,9 @@ MVP 只实现 `FFmpegRenderBackend`，内部可以复用当前 `ExecutorAgent` �
 
 ### 9.2 当前 FFmpeg 行为
 
-- 输入预检要求可解码视频流和音频流。
+- 输入支持一段或多段视频。多段素材先按上传顺序进行缩放补边、统一帧率与音频采样率，再合成为 `merged_source.mp4`；无音轨的个别片段补静音轨，但全部素材均无音频时仍拒绝进入语音分析。
+- `source_media.json` 保存原文件顺序、各段时长、合并时间线偏移和合并文件路径，后续候选、人工补片和渲染统一使用合并时间轴。
+- 输入预检要求所有文件具有可解码视频流，并且至少一段素材具有可用音频流。
 - 每个片段重新编码，避免关键帧切割偏移。
 - 支持拼接、淡转场、BGM、基础片头片尾和字幕烧录。
 - macOS 优先 `h264_videotoolbox`，失败时回退 `libx264`。
@@ -761,6 +779,8 @@ MCP、AE、Premiere、Resolve 和 FastCut 不进入当前实施范围。未来�
 output/tasks/<task_id>/
 ├── manifest.json
 ├── media_info.json
+├── source_media.json
+├── merged_source.mp4             # 仅多素材任务生成
 ├── requirement_brief.json
 ├── clarification_turns.jsonl
 ├── requirement_slots_v1.json
@@ -856,7 +876,7 @@ MVP 提供可重复的本地安装和环境检查；每条模型调用记录独�
 
 - 需求优先级、版本和确认规则。
 - `ReviewGate` 的版本绑定、旧版本失效和不可跳关规则。
-- 槽位补丁合并、已确认值保护、冲突检测、最多 5 个追问和重复问题过滤。
+- AI 动态问题的允许槽位校验、最多 3 个追问、重复过滤，以及槽位补丁合并、已确认值保护和冲突检测。
 - 状态转移表、Guard、非法跳转、状态版本和幂等事件。
 - Evidence 时间范围和候选引用完整性。
 - Unicode NFKC/受控标点归一化以及短中文实体不得模糊通过。

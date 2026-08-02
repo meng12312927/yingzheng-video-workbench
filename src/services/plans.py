@@ -213,6 +213,7 @@ class EditPlanService:
                 "candidate_ids": [segment.candidate_id for segment in retimed],
                 "execution_script": script,
                 "estimated_duration": script.estimated_duration,
+                "approval_exceptions": [],
                 "status": "draft",
                 "approved_at": None,
             }
@@ -283,6 +284,17 @@ class EditPlanService:
             errors.append("execution_script_mismatch")
         if abs(plan.estimated_duration - plan.execution_script.estimated_duration) > 0.01:
             errors.append("estimated_duration_mismatch")
+        lower_duration = max(
+            0.0,
+            plan.delivery_spec.target_duration - plan.delivery_spec.duration_tolerance,
+        )
+        upper_duration = (
+            plan.delivery_spec.target_duration + plan.delivery_spec.duration_tolerance
+        )
+        if plan.estimated_duration < lower_duration:
+            errors.append("plan_duration_too_short")
+        elif plan.estimated_duration > upper_duration:
+            errors.append("plan_duration_too_long")
         return PlanValidationResult(not errors, tuple(dict.fromkeys(errors)), missing)
 
     def _segments_from_candidates(

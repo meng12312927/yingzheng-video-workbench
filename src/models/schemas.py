@@ -181,6 +181,7 @@ class RequirementCompilation(BaseModel):
     mode: Literal["llm_generated", "manual_required"] = "llm_generated"
     warnings: list[str] = Field(default_factory=list)
     slots: list["RequirementSlot"] = Field(default_factory=list)
+    alignment_proposal: Optional["MaterialAlignmentProposal"] = None
 
 
 SlotStatus = Literal["missing", "inferred", "confirmed", "conflict", "unknown"]
@@ -198,7 +199,62 @@ class RequirementSlot(BaseModel):
     source_type: Literal["user_input", "form", "llm", "clarification", "domain_config"] = "llm"
     source_ref: Optional[str] = None
     question: Optional[str] = None
+    question_reason: Optional[str] = None
+    question_impact: Optional[str] = None
+    answer_hint: Optional[str] = None
+    question_source: Optional[str] = None
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ClarificationQuestion(BaseModel):
+    """澄清 Agent 的受约束输出；问题必须绑定现有任务书槽位。"""
+
+    slot_key: str = Field(min_length=1, max_length=64)
+    question: str = Field(min_length=4, max_length=160)
+    reason: str = Field(min_length=2, max_length=240)
+    impact: str = Field(min_length=2, max_length=240)
+    answer_hint: Optional[str] = Field(default=None, max_length=160)
+
+
+class MaterialAlignmentProposal(BaseModel):
+    """素材转录与初步任务书的对齐建议；只有用户选择后才能写入任务书。"""
+
+    id: str = Field(default_factory=lambda: new_id("alignment"))
+    requirement_spec_id: str
+    requirement_spec_version: int = Field(ge=1)
+    alignment_status: Literal["aligned", "too_vague", "mismatch"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    material_summary: str = Field(min_length=1, max_length=500)
+    detected_topics: list[str] = Field(default_factory=list, max_length=8)
+    rationale: str = Field(min_length=1, max_length=600)
+    suggested_requirement_text: str = Field(min_length=1, max_length=1500)
+    suggested_purpose: str = Field(min_length=1, max_length=200)
+    suggested_video_type: str = Field(default="general", max_length=50)
+    suggested_style: Literal["formal", "exciting", "warm", "funny", "general"] = "general"
+    suggested_target_duration: float = Field(ge=30.0, le=600.0)
+    suggested_focus_items: list[str] = Field(default_factory=list, min_length=1, max_length=6)
+    supporting_evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def requires_user_decision(self) -> bool:
+        return (
+            self.alignment_status in {"too_vague", "mismatch"}
+            and self.confidence >= 0.65
+        )
+
+
+class MaterialAlignmentDecision(BaseModel):
+    """用户对素材—需求对齐建议的选择。"""
+
+    id: str = Field(default_factory=lambda: new_id("alignment_decision"))
+    task_id: str
+    proposal_id: str
+    action: Literal["adopt", "edit_and_adopt", "keep_original"]
+    edited_requirement_text: Optional[str] = Field(default=None, max_length=1500)
+    resulting_requirement_version: int = Field(ge=1)
+    actor_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class ClarificationTurn(BaseModel):
@@ -618,6 +674,18 @@ class TimelineSegment(BaseModel):
         return self
 
 
+class PlanApprovalException(BaseModel):
+    """用户在生成前明确接受的计划级例外；只覆盖声明的校验项。"""
+
+    code: Literal["plan_duration_too_short"]
+    reason: str = Field(min_length=1, max_length=500)
+    planned_duration: float = Field(ge=0.0)
+    required_minimum: float = Field(ge=0.0)
+    target_duration: float = Field(ge=0.0)
+    approved_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class AuditableEditPlan(BaseModel):
     """用户审核的事实来源；EditScript 只是批准计划的执行视图。"""
 
@@ -630,6 +698,7 @@ class AuditableEditPlan(BaseModel):
     candidate_ids: list[str] = Field(default_factory=list)
     execution_script: EditScript
     estimated_duration: float = Field(ge=0.0)
+    approval_exceptions: list[PlanApprovalException] = Field(default_factory=list)
     status: Literal["draft", "approved", "superseded"] = "draft"
     created_at: datetime = Field(default_factory=utc_now)
     approved_at: Optional[datetime] = None

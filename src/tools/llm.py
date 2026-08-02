@@ -39,6 +39,7 @@ _client = OpenAI(
     timeout=LLM_TIMEOUT_SECONDS,
 )
 _embedding_client = None
+EMBEDDING_BATCH_SIZE = 10
 _call_context: ContextVar[dict | None] = ContextVar("model_call_context", default=None)
 
 
@@ -103,7 +104,11 @@ def _record_call(
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    """调用独立 Embedding 服务；返回顺序与输入文本严格一致。"""
+    """分批调用 Embedding 服务；返回顺序与输入文本严格一致。
+
+    阿里云 text-embedding-v3/v4 单次最多接受 10 条文本。这里使用保守的
+    10 条分批策略，同时兼容允许更大批次的 OpenAI-compatible 服务。
+    """
     global _embedding_client
     if not texts:
         return []
@@ -123,14 +128,22 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
             timeout=LLM_TIMEOUT_SECONDS,
         )
     try:
-        response = _embedding_client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-        ordered = sorted(response.data, key=lambda item: item.index)
+        vectors: List[List[float]] = []
+        usage = None
+        for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+            batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+            response = _embedding_client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+            usage = getattr(response, "usage", None)
+            ordered = sorted(response.data, key=lambda item: item.index)
+            if len(ordered) != len(batch):
+                raise ValueError("Embedding 返回数量与输入批次不一致")
+            vectors.extend(list(item.embedding) for item in ordered)
         _record_call(
             started_at=started_at,
             model=EMBEDDING_MODEL,
-            usage=getattr(response, "usage", None),
+            usage=usage,
         )
-        return [list(item.embedding) for item in ordered]
+        return vectors
     except Exception as error:
         _record_call(
             started_at=started_at,
@@ -260,27 +273,90 @@ def call_llm_with_tools(
     started_at = time.perf_counter()
     called_tools: List[str] = []
     usage = None
-    try:
-        for _ in range(max_rounds):
-            response = _client.chat.completions.create(
+
+    def parse_content(
+        message,
+        *,
+        context_messages: List[Dict[str, Any]],
+        finish_reason: str | None = None,
+    ) -> dict:
+        nonlocal usage
+        content = (message.content or "{}").strip()
+        try:
+            if finish_reason == "length":
+                raise json.JSONDecodeError("output truncated", content, len(content))
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1]
+            if content.endswith("```"):
+                content = content[:-3]
+            return json.loads(content.strip())
+        except json.JSONDecodeError as parse_error:
+            # 工具结果已经在 context_messages 中；不把可能被截断的长文本再次塞回
+            # 上下文，直接要求模型基于既有证据重新输出一份紧凑 JSON。
+            repair_response = _client.chat.completions.create(
                 model=LLM_MODEL,
-                messages=messages,
-                tools=tool_definitions,
-                tool_choice="auto",
+                messages=[
+                    *context_messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "停止调用工具。根据已有工具结果重新返回完整、简洁、合法的 JSON。"
+                            "不要解释，不要使用 Markdown，不要重复候选；务必在输出上限内闭合所有字段。"
+                        ),
+                    },
+                ],
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
             )
+            usage = getattr(repair_response, "usage", usage)
+            repaired_choice = repair_response.choices[0]
+            repaired_content = (repaired_choice.message.content or "{}").strip()
+            if getattr(repaired_choice, "finish_reason", None) == "length":
+                raise RuntimeError("结构化候选输出超过长度限制") from parse_error
+            if repaired_content.startswith("```"):
+                repaired_content = repaired_content.split("\n", 1)[1]
+            if repaired_content.endswith("```"):
+                repaired_content = repaired_content[:-3]
+            return json.loads(repaired_content.strip())
+
+    try:
+        for round_index in range(max_rounds):
+            force_final = round_index == max_rounds - 1 and bool(called_tools)
+            request_kwargs = {
+                "model": LLM_MODEL,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+            }
+            if not force_final:
+                request_kwargs.update({
+                    "tools": tool_definitions,
+                    "tool_choice": "auto",
+                })
+            else:
+                request_kwargs["messages"] = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "工具检索阶段已经结束。现在必须直接返回最终、紧凑、合法的 JSON；"
+                            "不要继续请求工具，不要输出解释或 Markdown。"
+                        ),
+                    },
+                ]
+            response = _client.chat.completions.create(**request_kwargs)
             usage = getattr(response, "usage", None)
-            message = response.choices[0].message
+            choice = response.choices[0]
+            message = choice.message
             tool_calls = message.tool_calls or []
             if not tool_calls:
-                content = (message.content or "{}").strip()
-                if content.startswith("```"):
-                    content = content.split("\n", 1)[1]
-                if content.endswith("```"):
-                    content = content[:-3]
-                result = json.loads(content.strip())
+                result = parse_content(
+                    message,
+                    context_messages=request_kwargs["messages"],
+                    finish_reason=getattr(choice, "finish_reason", None),
+                )
                 _record_call(
                     started_at=started_at,
                     model=LLM_MODEL,
@@ -308,7 +384,7 @@ def call_llm_with_tools(
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
-        raise RuntimeError("工具调用超过最大轮数，未得到结构化候选结果")
+        raise RuntimeError("工具调用结束后仍未得到结构化候选结果")
     except Exception as error:
         _record_call(
             started_at=started_at,
@@ -342,7 +418,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if not LLM_API_KEY:
-        print("请先在 .env 或 .env.deepseek 文件中设置 LLM_API_KEY")
+        print("请先在 .env 文件中设置 LLM_API_KEY")
     else:
         print("测试 JSON 返回...")
         result = call_llm(

@@ -164,12 +164,12 @@ class DenseEvidenceRetriever:
             return []
         cache_key = tuple(item.content_hash or item.id for item in items)
         if cache_key != self._cache_key or self._matrix is None:
-            vectors = np.asarray(self.embedding_fn([item.content for item in items]), dtype="float32")
+            vectors = np.asarray(self.embedding_fn([item.content for item in items]), dtype="float64")
             if vectors.ndim != 2 or len(vectors) != len(items):
                 raise ValueError("Embedding 返回数量或维度不正确")
             self._matrix = self._normalise(vectors)
             self._cache_key = cache_key
-        query_vector = np.asarray(self.embedding_fn([query]), dtype="float32")
+        query_vector = np.asarray(self.embedding_fn([query]), dtype="float64")
         if query_vector.ndim != 2 or query_vector.shape[0] != 1:
             raise ValueError("查询 Embedding 维度不正确")
         query_vector = self._normalise(query_vector)
@@ -192,8 +192,15 @@ class DenseEvidenceRetriever:
 
     @staticmethod
     def _normalise(matrix: np.ndarray) -> np.ndarray:
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        return matrix / np.maximum(norms, 1e-12)
+        # 先用 float64 求范数，避免异常大的 provider 数值在 float32 平方时溢出；
+        # 非有限向量直接交给上层关闭 dense 通道，不能让 NaN 污染 RRF 排序。
+        values = np.asarray(matrix, dtype="float64")
+        if not np.isfinite(values).all():
+            raise ValueError("Embedding 包含非有限数值")
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        if not np.isfinite(norms).all() or np.any(norms <= 1e-12):
+            raise ValueError("Embedding 向量范数无效")
+        return (values / norms).astype("float32")
 
 
 class HybridEvidenceRetriever:
@@ -216,8 +223,9 @@ class HybridEvidenceRetriever:
             try:
                 rankings.append(self.dense.search(query, items, limit))
             except Exception:
-                # Embedding 服务不可用时仍保证本地 BM25 可运行。
-                pass
+                # 当前进程内首次失败后停用向量通道，避免每个需求都重复请求
+                # 一个已确认不可用的服务；BM25 仍可继续完成证据召回。
+                self.dense = None
         non_empty = [ranking for ranking in rankings if ranking]
         if not non_empty:
             return []

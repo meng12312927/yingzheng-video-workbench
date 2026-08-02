@@ -277,6 +277,70 @@ def test_open_task_recovers_review_state_and_unapproved_plan_cannot_render(
         )
 
 
+def test_short_plan_requires_explicit_preapproval_and_is_not_rejected_after_render(
+    tmp_path: Path, monkeypatch
+):
+    task_dir, runtime = _review_task(tmp_path, monkeypatch)
+    recovered = VideoEditOrchestrator.open_task(task_dir.name, runtime)
+    short_spec = recovered.status.requirement_spec.model_copy(update={
+        "target_duration": 12,
+        "duration_tolerance": 2,
+        "need_subtitles": False,
+    })
+    short_delivery = recovered.status.edit_plan.delivery_spec.model_copy(update={
+        "target_duration": 12,
+        "duration_tolerance": 2,
+        "need_subtitles": False,
+    })
+    short_plan = recovered.status.edit_plan.model_copy(update={
+        "delivery_spec": short_delivery,
+    })
+    recovered.status.requirement_spec = short_spec
+    recovered.status.edit_plan = short_plan
+    recovered.store.write_model("requirement_spec_v1.json", short_spec)
+    recovered.store.write_model("edit_plan_v1.json", short_plan)
+
+    with pytest.raises(ValueError, match="至少需要 10.0 秒"):
+        recovered.approve_current_plan("tester")
+
+    approved = recovered.approve_current_plan(
+        "tester", allow_duration_exception=True
+    )
+
+    assert approved.status == "approved"
+    assert approved.approval_exceptions[0].code == "plan_duration_too_short"
+    assert approved.approval_exceptions[0].planned_duration == 5
+    audit = (task_dir / "audit_events.jsonl").read_text(encoding="utf-8")
+    assert "edit_plan_approved_with_exception" in audit
+
+    output = tmp_path / "short-approved.mp4"
+    output.write_bytes(b"video")
+    monkeypatch.setattr(
+        "src.services.verification.FFmpegTool.get_video_info",
+        lambda _: {"duration": 5.0, "has_video": True, "has_audio": True},
+    )
+    report = VerificationEngine().verify(
+        task_id=task_dir.name,
+        execution_result=ExecutionResult(
+            success=True,
+            output_path=str(output),
+            output_duration=5,
+            operations_done=1,
+            operations_failed=0,
+        ),
+        spec=short_spec,
+        plan=approved,
+        candidates=recovered.status.analysis.candidate_clips,
+    )
+
+    assert report.status == "passed"
+    assert any(
+        item.code == "duration_below_target_preapproved"
+        and item.method == "human"
+        for item in report.results
+    )
+
+
 def test_delivery_exception_can_return_to_review(tmp_path: Path):
     machine = TaskStateMachine(tmp_path / "delivery-revision")
     machine.initialise()

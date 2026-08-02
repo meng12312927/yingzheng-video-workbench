@@ -10,8 +10,6 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).parent.parent
 
 load_dotenv()
-# .env.deepseek 是本机私有配置，优先级高于通用 .env，且不会提交到 Git。
-load_dotenv(PROJECT_ROOT / ".env.deepseek", override=True)
 
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -30,7 +28,7 @@ EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com/v1"
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 if not LLM_API_KEY:
-    print("[WARNING] No LLM API key found. Set LLM_API_KEY in .env or .env.deepseek.")
+    print("[WARNING] No LLM API key found. Set LLM_API_KEY in .env.")
 
 # macOS 默认配置。Faster-Whisper 在 macOS 上稳定使用 CPU + int8；
 # 需要更高识别质量时可在 .env 中将模型改为 large-v3。
@@ -45,6 +43,10 @@ SUBTITLE_FONT_COLOR = "white"
 # 留空时让 Gradio 自动在 7860–7959 中寻找可用端口；需要固定端口再在 .env 中设置。
 _gradio_port = os.getenv("GRADIO_SERVER_PORT", "").strip()
 GRADIO_SERVER_PORT = int(_gradio_port) if _gradio_port else None
+# Gradio 自身会再次读取这个环境变量；空字符串会被它直接传给 int()。
+# 配置留空表示自动选端口，因此同时清除空值，避免启动时报 ValueError。
+if not _gradio_port:
+    os.environ.pop("GRADIO_SERVER_PORT", None)
 
 # 确保目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)

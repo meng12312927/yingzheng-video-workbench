@@ -28,6 +28,7 @@ class ScriptAgent(BaseAgent):
         analysis: ContentAnalysis,
         requirement: VideoRequirement,
         requirement_items: Optional[list[RequirementItem]] = None,
+        duration_tolerance: Optional[float] = None,
     ) -> EditScript:
         self._start_timer()
         must_ids = {
@@ -39,6 +40,7 @@ class ScriptAgent(BaseAgent):
             requirement.target_duration,
             analysis.video_duration,
             must_requirement_ids=must_ids,
+            duration_tolerance=duration_tolerance,
         )
         operations = [
             EditOperation(
@@ -72,9 +74,12 @@ class ScriptAgent(BaseAgent):
         target_duration: float,
         video_duration: float,
         must_requirement_ids: Optional[set[str]] = None,
+        duration_tolerance: Optional[float] = None,
     ) -> list[HighlightClip]:
         """先覆盖 must，再按评分补足预算；普通预算不能静默删除 must。"""
-        budget = target_duration * 1.15
+        tolerance = target_duration * 0.1 if duration_tolerance is None else duration_tolerance
+        minimum_duration = max(0.0, target_duration - tolerance)
+        budget = target_duration + tolerance
         selected: list[HighlightClip] = []
         total = 0.0
         must_ids = set(must_requirement_ids or set())
@@ -119,7 +124,7 @@ class ScriptAgent(BaseAgent):
                 continue
             selected.append(candidate)
             total += duration
-            if total >= target_duration * 0.85:
+            if total >= minimum_duration:
                 break
 
         return sorted(selected, key=lambda item: item.start)

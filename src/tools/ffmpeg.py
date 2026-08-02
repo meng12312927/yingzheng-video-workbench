@@ -260,6 +260,75 @@ class FFmpegTool:
         return True, "", actual_duration
 
     @staticmethod
+    def concatenate_source_videos(video_paths: list[str], output_path: str) -> bool:
+        """统一多段原素材的规格，并按传入顺序合成为一条可检索时间线。"""
+        if len(video_paths) < 2:
+            raise ValueError("合并原素材至少需要两个视频")
+
+        infos = [FFmpegTool.get_video_info(path) for path in video_paths]
+        if any(info is None for info in infos):
+            print("[FFmpeg] 有原素材无法读取")
+            return False
+
+        first_info = infos[0] or {}
+        width = max(2, int(first_info.get("width", 1280)) // 2 * 2)
+        height = max(2, int(first_info.get("height", 720)) // 2 * 2)
+        # 防止 4K 素材让 MVP 合并阶段占用过多资源，同时保留第一段素材的横竖方向。
+        scale = min(1.0, 1920 / width, 1920 / height)
+        width = max(2, int(width * scale) // 2 * 2)
+        height = max(2, int(height * scale) // 2 * 2)
+
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [FFmpegTool._find_ffmpeg(), "-hide_banner", "-loglevel", "error"]
+        for path in video_paths:
+            cmd.extend(["-i", str(path)])
+
+        filters: list[str] = []
+        concat_inputs: list[str] = []
+        for index, info in enumerate(infos):
+            assert info is not None
+            duration = max(0.01, float(info.get("duration", 0)))
+            filters.append(
+                f"[{index}:v:0]"
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                "setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS"
+                f"[source_v{index}]"
+            )
+            if info.get("has_audio"):
+                filters.append(
+                    f"[{index}:a:0]aresample=48000,"
+                    "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                    f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS[source_a{index}]"
+                )
+            else:
+                filters.append(
+                    "anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS[source_a{index}]"
+                )
+            concat_inputs.extend([f"[source_v{index}]", f"[source_a{index}]"])
+
+        filters.append(
+            "".join(concat_inputs)
+            + f"concat=n={len(video_paths)}:v=1:a=1[merged_v][merged_a]"
+        )
+        cmd.extend([
+            "-filter_complex", ";".join(filters),
+            "-map", "[merged_v]",
+            "-map", "[merged_a]",
+            *FFmpegTool._video_encode_args(),
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            "-y", str(destination),
+        ])
+        return FFmpegTool._run_with_encoder_fallback(
+            cmd,
+            f"按上传顺序合并 {len(video_paths)} 段原素材",
+        )
+
+    @staticmethod
     def cut_segment(
         video_path: str,
         start_time: float,

@@ -35,6 +35,8 @@ from pathlib import Path
 from typing import Optional
 
 from src.agents.requirement_agent import RequirementAgent
+from src.agents.clarification_agent import RequirementClarificationAgent
+from src.agents.alignment_agent import RequirementAlignmentAgent
 from src.agents.analysis_agent import AnalysisAgent
 from src.agents.candidate_agent import CandidateAgent
 from src.agents.style_agent import StyleRecommendationAgent
@@ -57,9 +59,11 @@ from src.models.schemas import (
     RequirementCompilation,
     RequirementItem,
     RequirementSpec,
-    RequirementSlot,
     HighlightClip,
     DeliveryReport,
+    MaterialAlignmentDecision,
+    MaterialAlignmentProposal,
+    PlanApprovalException,
 )
 from src.services.plans import EditPlanService
 from src.services.rendering import FFmpegRenderBackend
@@ -92,6 +96,8 @@ class VideoEditOrchestrator:
 
         # 创建领域组件；内容分析与候选判断明确分离。
         self.agent1 = RequirementAgent()
+        self.clarification_agent = RequirementClarificationAgent()
+        self.alignment_agent = RequirementAlignmentAgent()
         self.agent2 = AnalysisAgent(whisper_model_size=WHISPER_MODEL_SIZE)
         self.candidate_agent = CandidateAgent()
         self.style_agent = StyleRecommendationAgent()
@@ -127,10 +133,15 @@ class VideoEditOrchestrator:
         else:
             orchestrator = cls.__new__(cls)
             for name in (
-                "agent1", "agent2", "candidate_agent", "style_agent", "agent3", "agent4",
+                "agent1", "clarification_agent", "alignment_agent", "agent2", "candidate_agent", "style_agent", "agent3", "agent4",
                 "plan_service", "clarification_service", "verification_engine", "render_backend",
             ):
-                setattr(orchestrator, name, getattr(runtime, name))
+                value = getattr(runtime, name, None)
+                if name == "clarification_agent" and value is None:
+                    value = RequirementClarificationAgent()
+                if name == "alignment_agent" and value is None:
+                    value = RequirementAlignmentAgent()
+                setattr(orchestrator, name, value)
         orchestrator.task_dir = task_dir
         orchestrator.store = TaskStore(task_dir)
         orchestrator.state_machine = TaskStateMachine(task_dir)
@@ -233,8 +244,6 @@ class VideoEditOrchestrator:
           Agent 1 (需求理解) → Agent 2 (内容分析) →
           Agent 3 (脚本生成) → Agent 4 (执行处理)
         """
-        total_start = time.time()
-
         print("\n" + "=" * 60)
         print("  多 Agent 视频自动剪辑系统")
         print("=" * 60)
@@ -259,15 +268,134 @@ class VideoEditOrchestrator:
             "confirm_requirement_draft() 和 analyze_confirmed_requirement()"
         )
 
-    def create_requirement_draft(
+    def _generate_clarification_questions(
+        self,
+        compilation: RequirementCompilation,
+    ) -> RequirementCompilation:
+        """让澄清 Agent 只提问，不允许其直接修改任务书值。"""
+        clarification_agent = getattr(self, "clarification_agent", None)
+        if clarification_agent is None:
+            return compilation
+        version = compilation.spec.version
+        try:
+            with model_call_context(
+                self.task_dir,
+                stage="requirement_clarification",
+                prompt_template_version="clarification-question-v1",
+                input_spec_id=compilation.spec.id,
+                input_spec_version=version,
+            ):
+                questions = clarification_agent.run(
+                    raw_text=compilation.brief.raw_text,
+                    spec=compilation.spec,
+                    slots=compilation.slots,
+                    scenario=compilation.brief.scenario,
+                )
+            revised_spec, revised_slots = clarification_agent.apply_questions(
+                compilation.spec,
+                compilation.slots,
+                questions,
+            )
+            self._write_json(
+                f"clarification_questions_v{version}.json",
+                {
+                    "source": "ai",
+                    "prompt_template_version": "clarification-question-v1",
+                    "questions": [item.model_dump(mode="json") for item in questions],
+                },
+            )
+            return compilation.model_copy(update={
+                "spec": revised_spec,
+                "slots": revised_slots,
+            })
+        except Exception as error:
+            self._write_json(
+                f"clarification_questions_v{version}.json",
+                {
+                    "source": "ai_failed",
+                    "prompt_template_version": "clarification-question-v1",
+                    "questions": [],
+                    "error_type": type(error).__name__,
+                },
+            )
+            return compilation.model_copy(update={
+                "warnings": [
+                    *compilation.warnings,
+                    "AI 未能完成澄清问题分析；系统没有用固定问题冒充 AI 结果，请直接核对并修改任务书。",
+                ]
+            })
+
+    def _analyze_material_alignment(
         self,
         video_path: str,
+        compilation: RequirementCompilation,
+    ) -> RequirementCompilation:
+        """在任务书确认前理解素材，并缓存转录供正式候选分析复用。"""
+        alignment_agent = getattr(self, "alignment_agent", None)
+        analysis_agent = getattr(self, "agent2", None)
+        if alignment_agent is None or analysis_agent is None or not self.store:
+            return compilation
+        try:
+            with model_call_context(
+                self.task_dir,
+                stage="material_understanding",
+                prompt_template_version="material-summary-v1",
+                input_spec_id=compilation.spec.id,
+                input_spec_version=compilation.spec.version,
+            ):
+                analysis = analysis_agent.run(video_path, compilation.legacy_requirement)
+            self.store.write_model("material_analysis.json", analysis)
+            self.store.write_payload(
+                "transcript.json",
+                {"segments": [item.model_dump(mode="json") for item in analysis.transcript]},
+            )
+            self.store.write_payload(
+                "evidence.json",
+                {"evidence": [item.model_dump(mode="json") for item in analysis.evidence]},
+            )
+            if not any(item.type == "transcript" for item in analysis.evidence):
+                return compilation.model_copy(update={
+                    "warnings": [
+                        *compilation.warnings,
+                        "素材中没有识别出可用于需求对齐的语音证据，请直接核对任务书。",
+                    ]
+                })
+            with model_call_context(
+                self.task_dir,
+                stage="requirement_alignment",
+                prompt_template_version="material-alignment-v1",
+                input_spec_id=compilation.spec.id,
+                input_spec_version=compilation.spec.version,
+            ):
+                proposal = alignment_agent.run(
+                    raw_text=compilation.brief.raw_text,
+                    spec=compilation.spec,
+                    analysis=analysis,
+                    scenario=compilation.brief.scenario,
+                )
+            self.store.write_model("material_alignment_proposal.json", proposal)
+            return compilation.model_copy(update={"alignment_proposal": proposal})
+        except Exception as error:
+            self._write_json(
+                "material_alignment_failure.json",
+                {"error_type": type(error).__name__, "stage": "material_alignment"},
+            )
+            return compilation.model_copy(update={
+                "warnings": [
+                    *compilation.warnings,
+                    "素材理解与需求对齐本次未完成；你仍可直接审核任务书，候选阶段会继续使用已成功保存的转录。",
+                ]
+            })
+
+    def create_requirement_draft(
+        self,
+        video_path: str | list[str],
         user_input: str,
         scenario: str = "school",
         overrides: Optional[dict] = None,
         submitted_by: Optional[str] = None,
     ) -> RequirementCompilation:
-        """创建可编辑任务书；本方法不调用转录或候选分析。"""
+        """创建任务书，并预先理解素材以生成可审核的需求对齐建议。"""
         self.status = PipelineStatus(step="created", started_at=datetime.now().isoformat())
         self.task_dir = OUTPUT_DIR / "tasks" / uuid.uuid4().hex
         self.task_dir.mkdir(parents=True, exist_ok=False)
@@ -275,22 +403,72 @@ class VideoEditOrchestrator:
         self.state_machine = TaskStateMachine(self.task_dir)
         self.status.task_snapshot = self.state_machine.initialise()
         self.preview_paths = {}
-        self.video_path = str(Path(video_path).resolve())
-        media_info = FFmpegTool.get_video_info(video_path)
-        if not media_info or not media_info.get("has_audio"):
+
+        def reject_preflight(message: str) -> None:
             self._transition(
                 "task_failed",
                 "preflight-failed",
                 payload={
                     "error_code": "media_preflight_failed",
-                    "error_message": "需要可解码的视频和音频流",
+                    "error_message": message,
                 },
             )
-            self._write_manifest("failed", error="视频预检失败：需要可解码的视频和音频流")
-            raise ValueError("视频预检失败：需要可解码的视频和音频流")
+            self._write_manifest("failed", error=message)
+            raise ValueError(message)
+
+        raw_paths = [video_path] if isinstance(video_path, (str, Path)) else list(video_path)
+        source_paths = [str(Path(path).resolve()) for path in raw_paths if str(path).strip()]
+        if not source_paths:
+            reject_preflight("请至少上传一段视频素材")
+
+        source_entries = []
+        timeline_offset = 0.0
+        for index, source_path in enumerate(source_paths, start=1):
+            source_info = FFmpegTool.get_video_info(source_path)
+            if not source_info:
+                reject_preflight(f"第 {index} 段素材无法读取，请重新上传")
+            duration = float(source_info.get("duration", 0))
+            if duration <= 0:
+                reject_preflight(f"第 {index} 段素材时长无效，请重新上传")
+            source_entries.append({
+                "order": index,
+                "source_path": source_path,
+                "timeline_start": timeline_offset,
+                "timeline_end": timeline_offset + duration,
+                "duration": duration,
+                "has_audio": bool(source_info.get("has_audio")),
+            })
+            timeline_offset += duration
+
+        if not any(item["has_audio"] for item in source_entries):
+            reject_preflight("视频预检失败：上传的素材都没有可用音频流")
+
+        if len(source_paths) > 1:
+            merged_path = self.task_dir / "merged_source.mp4"
+            if not FFmpegTool.concatenate_source_videos(source_paths, str(merged_path)):
+                reject_preflight("多段素材合并失败，请检查素材格式后重试")
+            self.video_path = str(merged_path.resolve())
+        else:
+            self.video_path = source_paths[0]
+
+        self._write_json(
+            "source_media.json",
+            {
+                "merge_strategy": "upload_order",
+                "merged_video_path": self.video_path,
+                "sources": source_entries,
+            },
+        )
+        media_info = FFmpegTool.get_video_info(self.video_path)
+        if not media_info or not media_info.get("has_audio"):
+            reject_preflight("视频预检失败：需要可解码的视频和音频流")
         self._write_json("media_info.json", media_info)
         self._transition("preflight_passed", "preflight-passed")
-        self._write_manifest("preflight_ok", video_path=str(Path(video_path).resolve()))
+        self._write_manifest(
+            "preflight_ok",
+            video_path=self.video_path,
+            source_count=len(source_paths),
+        )
 
         try:
             with model_call_context(
@@ -304,6 +482,11 @@ class VideoEditOrchestrator:
                     submitted_by=submitted_by,
                     overrides=overrides,
                 )
+            compilation = self._analyze_material_alignment(self.video_path, compilation)
+            proposal = compilation.alignment_proposal
+            # 有明显模糊或错位时，先让用户决定是否采用素材驱动建议；决定后再动态追问。
+            if proposal is None or not proposal.requires_user_decision:
+                compilation = self._generate_clarification_questions(compilation)
         except Exception as error:
             self._fail_task("requirement_compilation_failed", error)
             raise
@@ -321,10 +504,7 @@ class VideoEditOrchestrator:
         self.status.execution_brief = compilation.execution_brief
         self.status.requirement_gate = gate
         self._transition("requirement_drafted", "requirement-drafted-v1")
-        needs_clarification = bool(
-            compilation.spec.open_questions
-            or any(item.status == "needs_confirmation" for item in compilation.spec.requirements)
-        )
+        needs_clarification = bool(compilation.spec.open_questions)
         if needs_clarification:
             self._transition("clarification_required", "clarification-required-v1")
         self.status.step = self.status.task_snapshot.state
@@ -334,6 +514,232 @@ class VideoEditOrchestrator:
             requirement_compilation_mode=compilation.mode,
         )
         return compilation
+
+    def resolve_material_alignment(
+        self,
+        action: str,
+        *,
+        actor_id: Optional[str] = None,
+        edited_requirement_text: Optional[str] = None,
+    ) -> RequirementCompilation:
+        """记录用户对素材建议的决定，并生成可继续澄清的新任务书版本。"""
+        if action not in {"adopt", "edit_and_adopt", "keep_original"}:
+            raise ValueError("未知的素材对齐决定")
+        if not self.store or not self.task_dir or not self.status.requirement_spec:
+            raise ValueError("当前没有可处理的素材对齐建议")
+        if (self.task_dir / "material_alignment_decision.json").exists():
+            raise ValueError("这条素材对齐建议已经处理，请继续审核当前任务书")
+        proposal = self.store.read_model(
+            "material_alignment_proposal.json", MaterialAlignmentProposal
+        )
+        previous_spec = self.status.requirement_spec
+        previous_execution = self.status.execution_brief
+        if not previous_execution or (
+            proposal.requirement_spec_id != previous_spec.id
+            or proposal.requirement_spec_version != previous_spec.version
+        ):
+            raise ValueError("素材建议与当前任务书版本不一致，请重新生成任务书")
+        brief = self.store.read_model("requirement_brief.json", RequirementBrief)
+        previous_legacy = self.store.read_model(
+            f"legacy_requirement_v{previous_spec.version}.json", VideoRequirement
+        )
+        try:
+            previous_slots = self.store.read_requirement_slots(previous_spec.version)
+        except (FileNotFoundError, ValueError):
+            previous_slots = []
+
+        decision_text = brief.raw_text
+        requirements = list(previous_spec.requirements)
+        updates = {
+            "purpose": previous_spec.purpose,
+            "audience": previous_spec.audience,
+            "video_type": previous_spec.video_type,
+            "style": previous_spec.style,
+            "target_duration": previous_spec.target_duration,
+            "duration_tolerance": previous_spec.duration_tolerance,
+            "need_subtitles": previous_spec.need_subtitles,
+            "need_bgm": previous_spec.need_bgm,
+        }
+        legacy = previous_legacy
+
+        if action == "adopt":
+            decision_text = proposal.suggested_requirement_text
+            preserved = [
+                item for item in previous_spec.requirements
+                if item.category != "content" or item.priority in {"must", "prohibited"}
+            ]
+            suggested = [
+                RequirementItem(
+                    category="content",
+                    description=item,
+                    priority="should",
+                    status="confirmed",
+                )
+                for item in proposal.suggested_focus_items
+            ]
+            quality_requirement = RequirementItem(
+                category="quality",
+                description="人物发言或问答必须保留完整，不在表达中途截断",
+                priority="should",
+                status="confirmed",
+            )
+            requirements = [*preserved, *suggested, quality_requirement]
+            updates.update({
+                "purpose": proposal.suggested_purpose,
+                "video_type": proposal.suggested_video_type,
+                "style": proposal.suggested_style,
+                "target_duration": proposal.suggested_target_duration,
+                "duration_tolerance": max(
+                    10.0, min(30.0, proposal.suggested_target_duration * 0.1)
+                ),
+            })
+            legacy = previous_legacy.model_copy(update={
+                "target_duration": int(proposal.suggested_target_duration),
+                "video_type": proposal.suggested_video_type,
+                "style": proposal.suggested_style,
+                "focus_keywords": proposal.suggested_focus_items,
+            })
+        elif action == "edit_and_adopt":
+            decision_text = str(edited_requirement_text or "").strip()
+            if not decision_text:
+                raise ValueError("请先修改 AI 建议，再选择“修改后采用”")
+            with model_call_context(
+                self.task_dir,
+                stage="alignment_user_revision",
+                prompt_template_version="requirement-compiler-v1",
+                input_spec_id=previous_spec.id,
+                input_spec_version=previous_spec.version,
+            ):
+                edited = self.agent1.compile(
+                    decision_text,
+                    scenario=brief.scenario,
+                    submitted_by=actor_id,
+                )
+            requirements = [
+                item.model_copy(update={"status": "confirmed"})
+                for item in edited.spec.requirements
+            ]
+            updates.update({
+                "purpose": edited.spec.purpose,
+                "audience": edited.spec.audience,
+                "video_type": edited.spec.video_type,
+                "style": edited.spec.style,
+                "target_duration": edited.spec.target_duration,
+                "duration_tolerance": edited.spec.duration_tolerance,
+                "need_subtitles": edited.spec.need_subtitles,
+                "need_bgm": edited.spec.need_bgm,
+            })
+            legacy = edited.legacy_requirement
+
+        revised_spec = previous_spec.model_copy(update={
+            **updates,
+            "version": previous_spec.version + 1,
+            "requirements": requirements,
+            "open_questions": [],
+            "status": "draft",
+            "confirmed_at": None,
+            "created_at": datetime.now(),
+        })
+        revised_execution = previous_execution.model_copy(update={
+            "version": previous_execution.version + 1,
+            "requirement_spec_version": revised_spec.version,
+            "visible_instruction": RequirementAgent._build_visible_instruction(revised_spec),
+            "included_requirement_ids": [item.id for item in requirements],
+            "status": "draft",
+            "confirmed_at": None,
+        })
+        if action == "keep_original":
+            slots = [
+                slot.model_copy(update={
+                    "question": None,
+                    "question_reason": None,
+                    "question_impact": None,
+                    "answer_hint": None,
+                    "question_source": None,
+                })
+                for slot in previous_slots
+            ]
+        else:
+            slots = RequirementAgent._build_slots(
+                brief.raw_text + "\n" + decision_text,
+                revised_spec,
+                scenario=brief.scenario,
+                overrides={
+                    "target_duration": revised_spec.target_duration,
+                    "style": revised_spec.style,
+                    "focus_keywords": [
+                        item.description for item in requirements if item.category == "content"
+                    ],
+                },
+                manual_required=False,
+            )
+        compilation = RequirementCompilation(
+            brief=brief,
+            spec=revised_spec,
+            execution_brief=revised_execution,
+            legacy_requirement=legacy,
+            slots=slots,
+            alignment_proposal=proposal,
+        )
+        compilation = self._generate_clarification_questions(compilation)
+        revised_spec = compilation.spec
+        revised_execution = compilation.execution_brief.model_copy(update={
+            "visible_instruction": RequirementAgent._build_visible_instruction(revised_spec),
+            "included_requirement_ids": [item.id for item in revised_spec.requirements],
+        })
+        gate = self.store.save_requirement_revision(
+            brief,
+            previous_spec,
+            revised_spec,
+            revised_execution,
+            actor_id,
+            slots=compilation.slots,
+        )
+        self.store.write_model(
+            f"legacy_requirement_v{revised_spec.version}.json", legacy
+        )
+        decision = MaterialAlignmentDecision(
+            task_id=self.store.task_id,
+            proposal_id=proposal.id,
+            action=action,
+            edited_requirement_text=(decision_text if action == "edit_and_adopt" else None),
+            resulting_requirement_version=revised_spec.version,
+            actor_id=actor_id,
+        )
+        self.store.write_model("material_alignment_decision.json", decision)
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action=f"material_alignment_{action}",
+                subject_type="MaterialAlignmentProposal",
+                subject_id=proposal.id,
+                subject_version=proposal.requirement_spec_version,
+                actor_type="user",
+                actor_id=actor_id,
+                summary={
+                    "adopt": "用户采用了素材驱动的需求优化建议。",
+                    "edit_and_adopt": "用户修改后采用了素材驱动的需求优化建议。",
+                    "keep_original": "用户选择保持原任务书。",
+                }[action],
+            )
+        )
+        self.status.requirement_spec = revised_spec
+        self.status.execution_brief = revised_execution
+        self.status.requirement_gate = gate
+        self.status.requirement = legacy
+        if revised_spec.open_questions:
+            self._transition(
+                "clarification_required",
+                f"alignment-clarification-required-v{revised_spec.version}",
+                actor_id=actor_id,
+            )
+        self.status.step = self.status.task_snapshot.state
+        self._write_manifest(
+            self.status.step,
+            requirement_version=str(revised_spec.version),
+            material_alignment_action=action,
+        )
+        return compilation.model_copy(update={"execution_brief": revised_execution})
 
     def confirm_requirement_draft(
         self,
@@ -349,6 +755,16 @@ class VideoEditOrchestrator:
         execution = self.status.execution_brief
         if not spec or not execution:
             raise ValueError("缺少当前需求任务书或执行说明")
+        proposal_path = self.task_dir / "material_alignment_proposal.json"
+        decision_path = self.task_dir / "material_alignment_decision.json"
+        if proposal_path.exists() and not decision_path.exists():
+            proposal = self.store.read_model(
+                "material_alignment_proposal.json", MaterialAlignmentProposal
+            )
+            if proposal.requires_user_decision:
+                raise ValueError(
+                    "请先处理素材与需求对齐建议：采用、修改后采用，或保持原任务书"
+                )
         if self.status.task_snapshot and self.status.task_snapshot.state == "awaiting_requirement_clarification":
             if not clarification_answers:
                 raise ValueError("任务书仍有待确认问题，请填写补充说明后再确认")
@@ -621,14 +1037,19 @@ class VideoEditOrchestrator:
         self.status.step = self.status.task_snapshot.state
         self._write_manifest(self.status.step, requirement_version=str(spec.version))
         try:
-            with model_call_context(
-                self.task_dir,
-                stage="transcription_summary",
-                prompt_template_version="content-summary-v1",
-                input_spec_id=spec.id,
-                input_spec_version=spec.version,
-            ):
-                analysis = self.agent2.run(video_path, requirement)
+            cached_material = self.task_dir / "material_analysis.json"
+            if cached_material.exists():
+                analysis = self.store.read_model("material_analysis.json", ContentAnalysis)
+                logger.info("复用任务书确认前生成的素材转录与证据，不重复运行 Whisper")
+            else:
+                with model_call_context(
+                    self.task_dir,
+                    stage="transcription_summary",
+                    prompt_template_version="content-summary-v1",
+                    input_spec_id=spec.id,
+                    input_spec_version=spec.version,
+                ):
+                    analysis = self.agent2.run(video_path, requirement)
         except Exception as error:
             self._fail_task("transcription_failed", error)
             raise
@@ -638,7 +1059,7 @@ class VideoEditOrchestrator:
             with model_call_context(
                 self.task_dir,
                 stage="candidate_analysis",
-                prompt_template_version="candidate-tools-v1",
+                prompt_template_version="candidate-tools-v2-batched",
                 input_spec_id=spec.id,
                 input_spec_version=spec.version,
             ):
@@ -647,6 +1068,9 @@ class VideoEditOrchestrator:
                     spec.requirements,
                     analysis.evidence,
                     analysis.video_duration,
+                    target_duration=spec.target_duration,
+                    duration_tolerance=spec.duration_tolerance,
+                    transcript=analysis.transcript,
                 )
         except Exception as error:
             self._fail_task("candidate_analysis_failed", error)
@@ -683,6 +1107,11 @@ class VideoEditOrchestrator:
                 "missing_must_requirement_ids": getattr(
                     generation, "missing_must_requirement_ids", []
                 ),
+                "degraded": getattr(generation, "degraded", False),
+                "failure_reason": getattr(generation, "failure_reason", None),
+                "failed_requirement_ids": getattr(
+                    generation, "failed_requirement_ids", []
+                ),
                 "rejected_candidate_ids": [item.id for item in rejected_candidates],
             },
         )
@@ -713,7 +1142,12 @@ class VideoEditOrchestrator:
         )
         self.store.write_model("analysis.json", analysis)
         try:
-            script = self.agent3.run(analysis, requirement, spec.requirements)
+            script = self.agent3.run(
+                analysis,
+                requirement,
+                spec.requirements,
+                duration_tolerance=spec.duration_tolerance,
+            )
         except Exception as error:
             self._fail_task("planning_failed", error)
             raise
@@ -885,7 +1319,12 @@ class VideoEditOrchestrator:
         )
         return revised
 
-    def approve_current_plan(self, actor_id: Optional[str] = None) -> AuditableEditPlan:
+    def approve_current_plan(
+        self,
+        actor_id: Optional[str] = None,
+        *,
+        allow_duration_exception: bool = False,
+    ) -> AuditableEditPlan:
         if not self.store or not self.status.edit_plan or not self.status.plan_gate:
             raise ValueError("没有可批准的剪辑计划")
         if not self.status.requirement_spec or not self.status.analysis:
@@ -902,9 +1341,70 @@ class VideoEditOrchestrator:
                 if item.type == "user_annotation"
             ],
         )
-        if not validation.valid:
-            raise ValueError("计划校验失败：" + "；".join(validation.errors))
-        approved, gate = self.store.approve_plan(self.status.plan_gate.id, actor_id)
+        approval_exceptions: list[PlanApprovalException] = []
+        duration_only = set(validation.errors) == {"plan_duration_too_short"}
+        if not validation.valid and allow_duration_exception and duration_only:
+            lower = max(
+                0.0,
+                self.status.edit_plan.delivery_spec.target_duration
+                - self.status.edit_plan.delivery_spec.duration_tolerance,
+            )
+            approval_exceptions.append(
+                PlanApprovalException(
+                    code="plan_duration_too_short",
+                    reason=(
+                        f"用户在生成前确认接受当前约 {self.status.edit_plan.estimated_duration:.1f} 秒的短版，"
+                        f"不再补足至任务书最低 {lower:.1f} 秒。"
+                    ),
+                    planned_duration=self.status.edit_plan.estimated_duration,
+                    required_minimum=lower,
+                    target_duration=self.status.edit_plan.delivery_spec.target_duration,
+                    approved_by=actor_id,
+                )
+            )
+        elif not validation.valid:
+            segment_number_by_id = {
+                segment.id: index
+                for index, segment in enumerate(self.status.edit_plan.timeline_segments, start=1)
+            }
+            messages = []
+            for error in validation.errors:
+                if error == "plan_duration_too_short":
+                    lower = max(
+                        0.0,
+                        self.status.edit_plan.delivery_spec.target_duration
+                        - self.status.edit_plan.delivery_spec.duration_tolerance,
+                    )
+                    messages.append(
+                        f"当前方案约 {self.status.edit_plan.estimated_duration:.1f} 秒，"
+                        f"至少需要 {lower:.1f} 秒；请补充候选片段后再生成"
+                    )
+                elif error == "plan_duration_too_long":
+                    upper = (
+                        self.status.edit_plan.delivery_spec.target_duration
+                        + self.status.edit_plan.delivery_spec.duration_tolerance
+                    )
+                    messages.append(
+                        f"当前方案约 {self.status.edit_plan.estimated_duration:.1f} 秒，"
+                        f"最多允许 {upper:.1f} 秒；请删减片段后再生成"
+                    )
+                elif error.startswith("segment_exceeds_candidate_context:"):
+                    segment_id = error.split(":", 1)[1]
+                    number = segment_number_by_id.get(segment_id, "未知")
+                    messages.append(
+                        f"片段 {number} 的起止时间超出 AI 候选证据范围；"
+                        "请缩短时间，或使用人工补片添加更大范围"
+                    )
+                elif error.startswith("missing_must:"):
+                    messages.append("仍有必须内容没有进入时间线")
+                else:
+                    messages.append("当前时间线存在未通过的证据或一致性检查")
+            raise ValueError("当前方案还不能生成成片：" + "；".join(dict.fromkeys(messages)))
+        approved, gate = self.store.approve_plan(
+            self.status.plan_gate.id,
+            actor_id,
+            approval_exceptions=approval_exceptions,
+        )
         self.status.edit_plan = approved
         self.status.plan_gate = gate
         self.status.script = approved.execution_script

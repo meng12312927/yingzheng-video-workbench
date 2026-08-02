@@ -41,6 +41,7 @@ class RequirementClarificationService:
 
         changed_ids: list[str] = []
         effective_answers: dict[str, str] = {}
+        recorded_answers: dict[str, str] = {}
         updated_slots: list[RequirementSlot] = []
         for slot in slot_list:
             raw_answer = answers.get(slot.key)
@@ -57,12 +58,16 @@ class RequirementClarificationService:
                             "source_type": "clarification",
                             "source_ref": f"requirement_v{spec.version + 1}",
                             "question": None,
+                            "question_reason": None,
+                            "question_impact": None,
+                            "answer_hint": None,
+                            "question_source": None,
                             "updated_at": utc_now(),
                         }
                     )
                 )
                 changed_ids.append(slot.id)
-                effective_answers[slot.key] = answer
+                recorded_answers[slot.key] = "暂时忽略"
                 continue
             if (
                 slot.status == "confirmed"
@@ -75,6 +80,10 @@ class RequirementClarificationService:
                         update={
                             "status": "conflict",
                             "question": f"“{slot.label}”已有确认值“{slot.value}”，是否明确替换为“{answer}”？",
+                            "question_reason": "本轮答案与此前已经确认的内容不一致。",
+                            "question_impact": "直接覆盖可能让后续选片和验收使用错误版本。",
+                            "answer_hint": "确认要替换时，请再次填写新的最终值。",
+                            "question_source": "deterministic-conflict-check",
                             "updated_at": utc_now(),
                         }
                     )
@@ -90,12 +99,17 @@ class RequirementClarificationService:
                         "source_type": "clarification",
                         "source_ref": f"requirement_v{spec.version + 1}",
                         "question": None,
+                        "question_reason": None,
+                        "question_impact": None,
+                        "answer_hint": None,
+                        "question_source": None,
                         "updated_at": utc_now(),
                     }
                 )
             )
             changed_ids.append(slot.id)
             effective_answers[slot.key] = answer
+            recorded_answers[slot.key] = answer
 
         new_requirements = list(spec.requirements)
         focus = effective_answers.get("focus_keywords")
@@ -177,7 +191,7 @@ class RequirementClarificationService:
             requirement_spec_id=spec.id,
             from_version=spec.version,
             to_version=revised_spec.version,
-            answers=effective_answers,
+            answers=recorded_answers,
             changed_slot_ids=changed_ids,
             actor_id=actor_id,
         )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 from src.models.schemas import (
     AuditableEditPlan,
@@ -55,12 +55,40 @@ class VerificationEngine:
         actual_duration = float(media_info.get("duration", 0.0)) if media_info else execution_result.output_duration
         lower = max(0.0, spec.target_duration - spec.duration_tolerance)
         upper = spec.target_duration + spec.duration_tolerance
-        duration_status = "passed" if lower <= actual_duration <= upper else "failed"
+        duration_exception = next(
+            (
+                item for item in plan.approval_exceptions
+                if item.code == "plan_duration_too_short"
+            ),
+            None,
+        )
+        duration_in_range = lower <= actual_duration <= upper
+        matches_approved_short_plan = bool(
+            duration_exception
+            and abs(actual_duration - plan.estimated_duration)
+            <= max(2.0, plan.estimated_duration * 0.08)
+        )
+        duration_status = "passed" if duration_in_range or matches_approved_short_plan else "failed"
+        if matches_approved_short_plan and not duration_in_range:
+            duration_summary = (
+                f"成片时长 {actual_duration:.1f} 秒；低于任务书要求 {lower:.1f}–{upper:.1f} 秒，"
+                f"但用户已在生成前明确接受约 {duration_exception.planned_duration:.1f} 秒的短版。"
+            )
+            duration_method = "human"
+            duration_code = "duration_below_target_preapproved"
+        else:
+            duration_summary = (
+                f"成片时长 {actual_duration:.1f} 秒；任务书要求 {lower:.1f}–{upper:.1f} 秒。"
+            )
+            duration_method = "deterministic"
+            duration_code = "duration_in_range" if duration_status == "passed" else "duration_out_of_range"
         results.append(
-            self._system(
-                duration_status,
-                f"成片时长 {actual_duration:.1f} 秒；任务书要求 {lower:.1f}–{upper:.1f} 秒。",
-                "duration_in_range" if duration_status == "passed" else "duration_out_of_range",
+            VerificationResult(
+                requirement_id="SYSTEM",
+                status=duration_status,
+                method=duration_method,
+                summary=duration_summary,
+                code=duration_code,
             )
         )
 
@@ -164,4 +192,3 @@ class VerificationEngine:
             summary=summary,
             code=code,
         )
-
