@@ -11,6 +11,7 @@ from src.ui.app import (
     _uploaded_video_paths,
     append_manual_segment,
     candidate_cards_to_rows,
+    create_ui,
 )
 
 
@@ -150,3 +151,16 @@ def test_duration_action_never_allows_missing_must_item_to_be_bypassed():
 
     assert not can_accept_short
     assert "必须内容不能通过接受短版跳过" in markdown
+
+
+def test_ui_has_branded_hierarchy_and_plain_language_actions():
+    demo = create_ui()
+    config_text = str(demo.get_config_file())
+
+    assert "YINGZHENG · AI VIDEO WORKBENCH" in config_text
+    assert "让每一次入选都有依据" in config_text
+    assert "上传素材与说明目标" in config_text
+    assert "确认任务书与执行依据" in config_text
+    assert "审核候选片段与时间线" in config_text
+    assert "查看成片与逐项验收" in config_text
+    assert "确认方案并生成成片" in config_text

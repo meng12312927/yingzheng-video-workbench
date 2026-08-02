@@ -1533,39 +1533,385 @@ def create_ui():
             padding: 14px;
         }
     }
+
+    /* 映证视觉系统：克制的品牌色、清晰的层级和适合长审核流程的留白。 */
+    :root {
+        --yz-ink: #182033;
+        --yz-muted: #667085;
+        --yz-line: #e5e9f2;
+        --yz-indigo: #5b5ce2;
+        --yz-indigo-deep: #3536a8;
+        --yz-violet: #805ad5;
+        --yz-shadow: 0 18px 45px rgba(28, 39, 76, 0.08);
+    }
+    body {
+        background:
+            radial-gradient(circle at 8% 0%, rgba(91, 92, 226, 0.10), transparent 28rem),
+            radial-gradient(circle at 96% 8%, rgba(128, 90, 213, 0.08), transparent 24rem),
+            #f6f7fb !important;
+    }
+    .gradio-container {
+        max-width: 1260px !important;
+        padding: 28px 24px 64px !important;
+        color: var(--yz-ink);
+    }
+    .hero-shell {
+        position: relative;
+        overflow: hidden;
+        padding: 42px 46px 38px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 28px;
+        color: #fff;
+        background: linear-gradient(130deg, #171a38 0%, #3536a8 58%, #7251bd 100%);
+        box-shadow: 0 28px 70px rgba(42, 44, 120, 0.22);
+    }
+    .hero-shell::after {
+        content: "";
+        position: absolute;
+        width: 360px;
+        height: 360px;
+        right: -100px;
+        top: -190px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.10);
+    }
+    .hero-kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 18px;
+        padding: 7px 12px;
+        border: 1px solid rgba(255, 255, 255, 0.24);
+        border-radius: 999px;
+        color: rgba(255, 255, 255, 0.86);
+        background: rgba(255, 255, 255, 0.08);
+        font-size: 13px;
+        letter-spacing: 0.08em;
+    }
+    .hero-title {
+        position: relative;
+        z-index: 1;
+        margin: 0;
+        color: #fff !important;
+        font-size: clamp(36px, 5vw, 54px);
+        line-height: 1.08;
+        letter-spacing: -0.04em;
+        font-weight: 760;
+    }
+    .hero-title span {
+        color: #c9c9ff !important;
+        font-weight: 620;
+    }
+    .hero-copy {
+        position: relative;
+        z-index: 1;
+        max-width: 760px;
+        margin: 18px 0 24px;
+        color: rgba(255, 255, 255, 0.78);
+        font-size: 16px;
+        line-height: 1.8;
+    }
+    .hero-points {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+    .hero-point {
+        padding: 8px 12px;
+        border-radius: 10px;
+        color: rgba(255, 255, 255, 0.9);
+        background: rgba(255, 255, 255, 0.09);
+        font-size: 13px;
+    }
+    .process-rail {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 10px;
+        margin: 18px 0 34px;
+    }
+    .process-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 14px;
+        border: 1px solid rgba(214, 219, 233, 0.86);
+        border-radius: 13px;
+        color: var(--yz-muted);
+        background: rgba(255, 255, 255, 0.78);
+        backdrop-filter: blur(12px);
+        font-size: 13px;
+        font-weight: 620;
+    }
+    .process-item b {
+        display: grid;
+        width: 24px;
+        height: 24px;
+        place-items: center;
+        flex: 0 0 auto;
+        border-radius: 8px;
+        color: var(--yz-indigo);
+        background: #eeeeff;
+        font-size: 12px;
+    }
+    .workflow-heading {
+        margin: 34px 0 14px !important;
+    }
+    .step-heading {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+    }
+    .step-index {
+        display: grid;
+        width: 46px;
+        height: 46px;
+        place-items: center;
+        flex: 0 0 auto;
+        border-radius: 14px;
+        color: #fff;
+        background: linear-gradient(140deg, var(--yz-indigo), var(--yz-violet));
+        box-shadow: 0 10px 24px rgba(91, 92, 226, 0.22);
+        font-size: 13px;
+        font-weight: 760;
+    }
+    .step-title {
+        color: var(--yz-ink);
+        font-size: 22px;
+        font-weight: 730;
+        letter-spacing: -0.02em;
+    }
+    .step-description {
+        margin-top: 3px;
+        color: var(--yz-muted);
+        font-size: 14px;
+    }
+    .intake-row,
+    #requirement-review,
+    #review-output,
+    .delivery-panel {
+        border: 1px solid var(--yz-line) !important;
+        border-radius: 20px !important;
+        background: rgba(255, 255, 255, 0.92) !important;
+        box-shadow: var(--yz-shadow);
+    }
+    .intake-row,
+    .delivery-panel {
+        gap: 20px !important;
+        padding: 20px !important;
+    }
+    .intake-column {
+        min-width: min(100%, 360px) !important;
+    }
+    .upload-note {
+        margin: 2px 4px 0;
+        color: var(--yz-muted);
+        font-size: 13px;
+        line-height: 1.6;
+    }
+    .template-label {
+        margin: 2px 0 -2px !important;
+        color: var(--yz-muted);
+        font-size: 13px;
+        font-weight: 650;
+    }
+    .gradio-container .block,
+    .gradio-container .form {
+        border-color: var(--yz-line);
+        border-radius: 14px;
+    }
+    .gradio-container textarea,
+    .gradio-container input {
+        line-height: 1.6;
+    }
+    .gradio-container button {
+        border-radius: 12px !important;
+        font-weight: 680 !important;
+        transition: transform 160ms ease, box-shadow 160ms ease, filter 160ms ease;
+    }
+    .gradio-container button:hover {
+        transform: translateY(-1px);
+    }
+    .gradio-container button.primary {
+        border: 0 !important;
+        background: linear-gradient(135deg, var(--yz-indigo), var(--yz-indigo-deep)) !important;
+        box-shadow: 0 10px 22px rgba(73, 74, 190, 0.20);
+    }
+    .primary-action button {
+        min-height: 50px;
+        font-size: 15px !important;
+    }
+    #review-output {
+        max-height: none;
+        padding: 26px 30px;
+    }
+    #requirement-review {
+        padding: 26px 30px;
+        border-color: var(--yz-line) !important;
+    }
+    #review-output blockquote {
+        border-left: 3px solid var(--yz-indigo);
+        border-radius: 0 10px 10px 0;
+        background: #f4f4ff;
+    }
+    #requirement-review h2,
+    #review-output h2 {
+        margin-top: 0;
+        color: var(--yz-ink);
+    }
+    .export-action {
+        padding: 18px 20px;
+        border: 1px solid rgba(91, 92, 226, 0.24);
+        border-radius: 18px;
+        background: linear-gradient(135deg, #f7f7ff, #f1efff);
+    }
+    .action-status {
+        min-height: 40px;
+        padding: 9px 13px;
+        border: 1px solid #e3e4ff;
+        border-radius: 11px;
+        color: #444a61;
+        background: #f6f6ff;
+    }
+    .action-status p {
+        margin: 0;
+    }
+    .question-card,
+    .candidate-edit-card {
+        border-color: var(--yz-line);
+        border-radius: 18px;
+        background: #fff;
+        box-shadow: 0 12px 32px rgba(31, 43, 77, 0.06);
+    }
+    .question-card {
+        padding: 16px;
+    }
+    .candidate-edit-card {
+        padding: 20px;
+        margin: 14px 0;
+    }
+    .alignment-card,
+    .manual-add-card {
+        padding: 20px;
+        border: 1px solid rgba(91, 92, 226, 0.30);
+        border-radius: 18px;
+        background: linear-gradient(135deg, #fafaff, #f3f2ff);
+    }
+    .duration-decision-card {
+        padding: 20px;
+        border: 1px solid rgba(217, 139, 20, 0.38);
+        border-radius: 18px;
+        background: #fff9ed;
+    }
+    .candidate-preview video {
+        border-radius: 14px;
+    }
+    .quiet-footer {
+        margin-top: 42px;
+        padding: 22px 4px 0;
+        border-top: 1px solid var(--yz-line);
+        color: var(--yz-muted);
+        text-align: center;
+        font-size: 13px;
+        line-height: 1.8;
+    }
+    .quiet-footer b {
+        color: var(--yz-ink);
+    }
+    footer {
+        display: none !important;
+    }
+    @media (max-width: 800px) {
+        .gradio-container {
+            padding: 14px 12px 40px !important;
+        }
+        .hero-shell {
+            padding: 30px 24px;
+            border-radius: 22px;
+        }
+        .hero-copy {
+            font-size: 14px;
+        }
+        .process-rail {
+            grid-template-columns: repeat(2, 1fr);
+        }
+        .intake-row,
+        .delivery-panel {
+            padding: 14px !important;
+        }
+        #requirement-review,
+        #review-output {
+            padding: 18px;
+        }
+        .step-title {
+            font-size: 19px;
+        }
+    }
+    @media (max-width: 520px) {
+        .process-rail {
+            grid-template-columns: 1fr;
+        }
+    }
     """
 
     with gr.Blocks(
         title="映证｜活动视频需求与审核工作台",
         css=custom_css,
-        theme=gr.themes.Soft(),
+        theme=gr.themes.Soft(
+            primary_hue="indigo",
+            neutral_hue="slate",
+            radius_size="lg",
+        ),
     ) as demo:
 
-        # 标题
         gr.Markdown(
             """
-            <div class="main-title">🎬 映证</div>
+            <div class="hero-shell">
+                <div class="hero-kicker">YINGZHENG · AI VIDEO WORKBENCH</div>
+                <h1 class="hero-title">映证 <span>｜让每一次入选都有依据</span></h1>
+                <p class="hero-copy">把模糊的活动视频要求整理成清晰任务书，逐段核对 AI 选片依据，确认无误后再生成可验收的粗剪。</p>
+                <div class="hero-points">
+                    <span class="hero-point">需求可修改</span>
+                    <span class="hero-point">片段可预览</span>
+                    <span class="hero-point">决策可追溯</span>
+                    <span class="hero-point">成片可验收</span>
+                </div>
+            </div>
             """
         )
         gr.Markdown(
             """
-            活动视频需求与审核工作台：先说清要什么，再审核有依据的候选片段。
-            支持学校和企业活动视频的本地粗剪。
+            <div class="process-rail">
+                <div class="process-item"><b>01</b> 上传与说明</div>
+                <div class="process-item"><b>02</b> 确认任务书</div>
+                <div class="process-item"><b>03</b> 审核候选</div>
+                <div class="process-item"><b>04</b> 出片与验收</div>
+            </div>
             """
         )
 
-        gr.Markdown("### 1. 上传素材并说明需求", elem_classes=["workflow-heading"])
-        with gr.Row(equal_height=False):
-            with gr.Column(scale=3):
+        gr.Markdown(
+            """
+            <div class="step-heading"><span class="step-index">01</span><div><div class="step-title">上传素材与说明目标</div><div class="step-description">先用大白话描述想要什么，AI 会帮你整理，不需要预先懂剪辑术语。</div></div></div>
+            """,
+            elem_classes=["workflow-heading"],
+        )
+        with gr.Row(equal_height=False, elem_classes=["intake-row"]):
+            with gr.Column(scale=5, elem_classes=["intake-column"]):
                 video_input = gr.File(
-                    label="📤 上传一个或多个视频（按列表顺序拼接）",
+                    label="上传一个或多个视频",
                     file_count="multiple",
                     file_types=["video"],
                     type="filepath",
                 )
-                gr.Markdown("可一次上传多段手机、相机或电脑素材；系统会按上方列表顺序合成一条长视频。")
+                gr.Markdown(
+                    "支持手机、相机和电脑素材；多段视频将按列表顺序拼接。",
+                    elem_classes=["upload-note"],
+                )
+            with gr.Column(scale=7, elem_classes=["intake-column"]):
                 user_input = gr.Textbox(
-                    label="✏️ 剪辑需求（自然语言描述）",
+                    label="你希望剪成什么样？",
                     placeholder="例如：帮我把运动会视频剪成3分钟精彩集锦，重点要冲刺和颁奖的画面",
                     lines=3,
                 )
@@ -1583,10 +1929,10 @@ def create_ui():
                         label="目标时长（秒）",
                     )
                 keywords = gr.Textbox(
-                    label="重点关键词（可选，逗号分隔）",
+                    label="重点内容（可选）",
                     placeholder="例如：冲刺，颁奖，领导讲话",
                 )
-                gr.Markdown("**快捷需求模板：**")
+                gr.Markdown("快捷填写", elem_classes=["template-label"])
                 gr.Examples(
                     examples=[
                         ["帮我把运动会视频剪成3分钟精彩集锦"],
@@ -1596,9 +1942,10 @@ def create_ui():
                     inputs=user_input,
                 )
                 submit_btn = gr.Button(
-                    "🧾 生成需求任务书",
+                    "生成需求任务书",
                     variant="primary",
                     size="lg",
+                    elem_classes=["primary-action"],
                 )
                 requirement_action_status = gr.Markdown(
                     "点击后会在这里显示处理状态。",
@@ -1606,7 +1953,12 @@ def create_ui():
                 )
 
         plan_state = gr.State(value=None)
-        gr.Markdown("### 2. 审核任务书与 AI 执行依据", elem_classes=["workflow-heading"])
+        gr.Markdown(
+            """
+            <div class="step-heading"><span class="step-index">02</span><div><div class="step-title">确认任务书与执行依据</div><div class="step-description">检查 AI 是否准确理解用途、受众和必须保留的内容，确认后才会分析素材。</div></div></div>
+            """,
+            elem_classes=["workflow-heading"],
+        )
         requirement_result_text = gr.Markdown(
             value="等待上传视频并生成任务书...",
             elem_id="requirement-review",
@@ -1737,7 +2089,12 @@ def create_ui():
                 label="背景音乐音量",
             )
 
-        gr.Markdown("### 3. 审核片段与时间线", elem_classes=["workflow-heading"])
+        gr.Markdown(
+            """
+            <div class="step-heading"><span class="step-index">03</span><div><div class="step-title">审核候选片段与时间线</div><div class="step-description">边看片段、边看依据；保留、删除、排序和补片都在这里完成。</div></div></div>
+            """,
+            elem_classes=["workflow-heading"],
+        )
         candidate_result_text = gr.Markdown(
             value="等待确认任务书并分析素材...",
             elem_id="review-output",
@@ -1866,45 +2223,49 @@ def create_ui():
                 candidate_subtitles.append(candidate_subtitle)
                 candidate_titles.append(candidate_title)
         with gr.Group(elem_classes=["export-action"]):
-            gr.Markdown("**确认候选、时间线和样式后，再生成成片。系统会先保存审核版本并执行逐项验收。**")
-            export_btn = gr.Button("🎬 确认方案并生成成片", variant="primary", size="lg", visible=False)
+            gr.Markdown("**确认候选、时间线和样式后生成成片。系统会保存审核版本，并在导出后逐项验收。**")
+            export_btn = gr.Button(
+                "确认方案并生成成片",
+                variant="primary",
+                size="lg",
+                visible=False,
+                elem_classes=["primary-action"],
+            )
 
-        gr.Markdown("### 4. 查看成片与逐项验收", elem_classes=["workflow-heading"])
-        delivery_result_text = gr.Markdown(value="等待生成成片...")
-        output_video = gr.Video(label="🎥 成品视频", autoplay=False)
-        subtitle_output = gr.Textbox(
-            label="📝 SRT 字幕",
-            info="可以复制保存为 .srt 文件",
-            lines=5,
-            visible=False,
+        gr.Markdown(
+            """
+            <div class="step-heading"><span class="step-index">04</span><div><div class="step-title">查看成片与逐项验收</div><div class="step-description">最终视频和验收结论并排呈现；有异常时可以返回修改或记录例外。</div></div></div>
+            """,
+            elem_classes=["workflow-heading"],
         )
-        exception_reason = gr.Textbox(
-            label="交付例外原因",
-            placeholder="仅在逐项验收存在问题时填写；也可以修改时间线后重新生成。",
-            lines=3,
-            visible=False,
+        with gr.Row(equal_height=False, elem_classes=["delivery-panel"]):
+            with gr.Column(scale=5):
+                delivery_result_text = gr.Markdown(value="等待生成成片...")
+                exception_reason = gr.Textbox(
+                    label="交付例外原因",
+                    placeholder="仅在逐项验收存在问题时填写；也可以修改时间线后重新生成。",
+                    lines=3,
+                    visible=False,
+                )
+                approve_exception_btn = gr.Button(
+                    "接受例外并批准交付",
+                    variant="stop",
+                    visible=False,
+                )
+            with gr.Column(scale=7):
+                output_video = gr.Video(label="成品视频", autoplay=False)
+                subtitle_output = gr.Textbox(
+                    label="SRT 字幕",
+                    info="可以复制保存为 .srt 文件",
+                    lines=5,
+                    visible=False,
+                )
+
+        gr.Markdown(
+            """
+            <div class="quiet-footer"><b>映证 MVP2</b> · 本地处理 · 人工审核 · 全程留痕<br>Python · OpenAI-compatible LLM · Faster-Whisper · FFmpeg · Gradio</div>
+            """
         )
-        approve_exception_btn = gr.Button(
-            "接受例外并批准交付",
-            variant="stop",
-            visible=False,
-        )
-
-        # 底部说明
-        gr.Markdown("""
-        ---
-        ### 📖 使用说明
-
-        1. **上传视频**：支持 mp4, mov, avi, mkv 等常见格式
-        2. **描述需求**：用大白话说明成片用途和重点内容
-        3. **确认任务书**：检查内容要求与 AI 执行说明，确认后才开始分析
-        4. **审核候选**：核对原文证据、入选理由和预览，选择保留内容
-        5. **确认导出**：批准当前方案并下载带字幕的初稿
-
-        ### 🔧 技术栈
-
-        `Python` · `OpenAI GPT-4o-mini` · `Faster-Whisper` · `FFmpeg` · `Gradio`
-        """)
 
         # 绑定事件
         submit_started = submit_btn.click(
