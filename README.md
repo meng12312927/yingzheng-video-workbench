@@ -6,7 +6,7 @@
 
 ![映证工作台首页](docs/assets/ui-home.jpg)
 
-项目说明：[系统架构](docs/architecture.md) · [可复现案例](docs/case-study.md) · [真实用户验证方案](docs/real-user-validation.md) · [简历表述](docs/resume-bullets.md) · [产品需求](docs/PRD.md) · [技术方案](docs/technical-plan.md)
+项目说明：[系统架构](docs/architecture.md) · [真实用户验证方案](docs/real-user-validation.md) · [产品需求](docs/PRD.md) · [技术方案](docs/technical-plan.md)
 
 ## 能力边界
 
@@ -65,7 +65,3 @@ cp .env.example .env
 自动测试覆盖需求版本与澄清、状态机幂等和恢复、审核门禁、证据构建与检索、候选引文校验、受限工具调用、可审计计划、交付验收、模型调用元数据，以及本地 FFmpeg 的预检、转场、BGM、字幕、片头片尾和成片读取。离线评测读取学校/企业各 3 个标注任务并写入 `output/evaluation_report.json`，比较 BM25、RRF 与 RRF + Rerank 的 Recall@K、MRR/NDCG、延迟、引用有效率、幻觉率和人工修改率，同时保留原始需求/无证据消融及 Embedding 故障降级结果。
 
 离线标注集用于工程回归，不等同于真实用户验证。真实用户任务必须按照[验证方案](docs/real-user-validation.md)单独记录操作者、人工基准、审核时间和返工数据。
-
-## 学习路线
-
-如果需要系统接管项目并准备 AI 应用开发实习，可按 [映证项目 21 天接管与 AI 应用开发实习冲刺计划](docs/learning-plan-21-days.md) 学习。计划按每天 6–9 小时设计，包含每日代码范围、通用知识、动手实验、测试、面试问题、每周闸门和三周后的继续学习路线。
