@@ -45,6 +45,7 @@ class TaskStore:
 
     def write_payload(self, filename: str, payload: dict) -> Path:
         destination = self.task_dir / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(
             f".{destination.name}.{uuid.uuid4().hex}.tmp"
         )
@@ -173,7 +174,7 @@ class TaskStore:
         actor_id: str | None = None,
         previous_plan: AuditableEditPlan | None = None,
     ) -> ReviewGate:
-        """保存计划版本并创建唯一的合并方案审核 Gate。"""
+        """保存计划版本并创建唯一的剪辑方案审核 Gate。"""
         if plan.status != "draft":
             raise ValueError("只有 draft 计划可以进入审核")
         if previous_plan is not None:

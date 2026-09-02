@@ -21,6 +21,8 @@ Python 知识点：
 ===========================================================================
 """
 
+from __future__ import annotations
+
 import tempfile
 import shutil
 from pathlib import Path
@@ -48,7 +50,7 @@ class ExecutorAgent(BaseAgent):
     def run(
         self,
         script: EditScript,
-        video_path: str,
+        video_path: str | dict[str, str],
         output_path: str = "",
     ) -> ExecutionResult:
         """
@@ -71,7 +73,17 @@ class ExecutorAgent(BaseAgent):
         log_lines = []
 
         # 1. 准备输出路径
-        source_info = FFmpegTool.get_video_info(video_path)
+        source_paths = (
+            dict(video_path) if isinstance(video_path, dict) else {"legacy": video_path}
+        )
+        source_info_by_id = {
+            source_id: FFmpegTool.get_video_info(path)
+            for source_id, path in source_paths.items()
+        }
+        source_info = next(
+            (item for item in source_info_by_id.values() if item),
+            None,
+        )
         if not source_info:
             return self._fail(["无法读取输入视频，请确认文件可被 FFmpeg 解码"], log_lines)
         if not output_path:
@@ -100,14 +112,24 @@ class ExecutorAgent(BaseAgent):
                     self.log(f"跳过操作 #{op.order}: 缺少时间信息", level="warning")
                     failed += 1
                     continue
-                if not (0 <= op.source_start < op.source_end <= source_info["duration"]):
+                source_id = op.source_asset_id or "legacy"
+                operation_path = source_paths.get(source_id)
+                operation_info = source_info_by_id.get(source_id)
+                if op.source_asset_id is None and len(source_paths) == 1:
+                    operation_path = next(iter(source_paths.values()))
+                    operation_info = next(iter(source_info_by_id.values()))
+                if not operation_path or not operation_info:
+                    errors.append(f"裁剪片段 #{op.order} 找不到来源素材")
+                    failed += 1
+                    continue
+                if not (0 <= op.source_start < op.source_end <= operation_info["duration"]):
                     errors.append(f"裁剪片段 #{op.order} 时间范围超出原视频")
                     failed += 1
                     continue
 
                 seg_path = str(temp_dir / f"seg_{op.order:03d}.mp4")
                 success = FFmpegTool.cut_segment(
-                    video_path,
+                    operation_path,
                     op.source_start,
                     op.source_end,
                     seg_path,

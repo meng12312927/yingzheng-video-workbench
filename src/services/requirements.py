@@ -139,6 +139,7 @@ class RequirementClarificationService:
                     status="confirmed",
                 )
             )
+
         elif any(
             slot.key == "high_risk_review" and slot.status == "unknown"
             for slot in updated_slots
@@ -154,6 +155,38 @@ class RequirementClarificationService:
                     status="needs_confirmation",
                 )
             )
+
+        for key, answer in effective_answers.items():
+            if not key.startswith("material_"):
+                continue
+            if key.startswith("material_exclude_"):
+                new_requirements.append(
+                    RequirementItem(
+                        category="restriction",
+                        description=f"不得选入用户明确排除的素材内容：{answer}",
+                        priority="prohibited",
+                        status="confirmed",
+                        acceptance_rule="最终候选和时间线不得包含该内容；不确定时必须提示人工复核",
+                    )
+                )
+            elif key.startswith("material_risk_"):
+                new_requirements.append(
+                    RequirementItem(
+                        category="compliance",
+                        description=f"素材相关人工核对说明：{answer}",
+                        priority="should",
+                        status="confirmed",
+                    )
+                )
+            else:
+                new_requirements.append(
+                    RequirementItem(
+                        category="content",
+                        description=f"用户确认的素材剪辑决定：{answer}",
+                        priority="should",
+                        status="confirmed",
+                    )
+                )
 
         updates: dict = {
             "version": spec.version + 1,

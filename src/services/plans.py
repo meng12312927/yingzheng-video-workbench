@@ -60,7 +60,8 @@ class EditPlanService:
             matched = next(
                 (
                     candidate for candidate in candidates
-                    if abs(candidate.source_start - operation.source_start) < 0.01
+                    if candidate.source_asset_id == operation.source_asset_id
+                    and abs(candidate.source_start - operation.source_start) < 0.01
                     and abs(candidate.source_end - operation.source_end) < 0.01
                 ),
                 None,
@@ -126,7 +127,11 @@ class EditPlanService:
                 if getattr(segment, key) != value
             }
             revised = segment.model_copy(update=allowed)
-            if revised.source_start < 0 or revised.source_end > analysis.video_duration:
+            source_duration = self._source_duration(
+                analysis.source_durations or analysis.video_duration,
+                revised.source_asset_id,
+            )
+            if revised.source_start < 0 or revised.source_end > source_duration:
                 raise ValueError("修订片段超出素材范围")
             if allowed:
                 keys = set(allowed)
@@ -170,11 +175,19 @@ class EditPlanService:
             candidate_id = str(raw.get("candidate_id") or new_id("manual_candidate"))
             source_start = float(raw["source_start"])
             source_end = float(raw["source_end"])
-            if not 0 <= source_start < source_end <= analysis.video_duration:
+            source_asset_id = raw.get("source_asset_id")
+            if analysis.source_durations and not source_asset_id:
+                raise ValueError("多素材任务的人工补片必须选择来源素材")
+            source_duration = self._source_duration(
+                analysis.source_durations or analysis.video_duration,
+                source_asset_id,
+            )
+            if not 0 <= source_start < source_end <= source_duration:
                 raise ValueError("人工补片超出素材范围")
             segment = TimelineSegment(
                 order=int(raw.get("order", len(segments) + 1)),
                 candidate_id=candidate_id,
+                source_asset_id=source_asset_id,
                 source_start=source_start,
                 source_end=source_end,
                 output_start=0,
@@ -225,7 +238,7 @@ class EditPlanService:
         plan: AuditableEditPlan,
         spec: RequirementSpec,
         candidates: Iterable[CandidateClip],
-        video_duration: float,
+        video_duration: float | dict[str, float],
         known_evidence_ids: Optional[Iterable[str]] = None,
         user_annotation_evidence_ids: Optional[Iterable[str]] = None,
     ) -> PlanValidationResult:
@@ -248,7 +261,10 @@ class EditPlanService:
         if missing:
             errors.extend(f"missing_must:{item_id}" for item_id in missing)
         for segment in plan.timeline_segments:
-            if not 0 <= segment.source_start < segment.source_end <= video_duration:
+            source_duration = self._source_duration(
+                video_duration, segment.source_asset_id
+            )
+            if not 0 <= segment.source_start < segment.source_end <= source_duration:
                 errors.append(f"segment_outside_media:{segment.id}")
             if not segment.matched_requirement_ids:
                 errors.append(f"segment_missing_requirement:{segment.id}")
@@ -265,6 +281,8 @@ class EditPlanService:
                 candidate = candidate_by_id.get(segment.candidate_id)
                 if candidate is None:
                     errors.append(f"unknown_candidate:{segment.candidate_id}")
+                elif candidate.source_asset_id != segment.source_asset_id:
+                    errors.append(f"segment_candidate_source_mismatch:{segment.id}")
                 elif not (
                     candidate.source_start - 5 <= segment.source_start
                     and segment.source_end <= candidate.source_end + 5
@@ -273,12 +291,13 @@ class EditPlanService:
             elif user_evidence_ids is not None and not set(segment.evidence_ids).intersection(user_evidence_ids):
                 errors.append(f"manual_segment_missing_user_annotation:{segment.id}")
         operation_ranges = [
-            (operation.source_start, operation.source_end)
+            (operation.source_asset_id, operation.source_start, operation.source_end)
             for operation in plan.execution_script.operations
             if operation.action == "cut"
         ]
         timeline_ranges = [
-            (segment.source_start, segment.source_end) for segment in plan.timeline_segments
+            (segment.source_asset_id, segment.source_start, segment.source_end)
+            for segment in plan.timeline_segments
         ]
         if operation_ranges != timeline_ranges:
             errors.append("execution_script_mismatch")
@@ -306,6 +325,7 @@ class EditPlanService:
             TimelineSegment(
                 order=index,
                 candidate_id=candidate.id,
+                source_asset_id=candidate.source_asset_id,
                 source_start=candidate.source_start,
                 source_end=candidate.source_end,
                 output_start=0,
@@ -355,6 +375,7 @@ class EditPlanService:
         operations = [
             EditOperation(
                 order=segment.order,
+                source_asset_id=segment.source_asset_id,
                 action="cut",
                 source_start=segment.source_start,
                 source_end=segment.source_end,
@@ -402,6 +423,11 @@ class EditPlanService:
                 subtitle_index += 1
                 continue
             for source in transcript:
+                if (
+                    segment.source_asset_id is not None
+                    and source.source_asset_id != segment.source_asset_id
+                ):
+                    continue
                 overlap_start = max(source.start, segment.source_start)
                 overlap_end = min(source.end, segment.source_end)
                 if overlap_end <= overlap_start or not source.text.strip():
@@ -416,6 +442,17 @@ class EditPlanService:
                 ])
                 subtitle_index += 1
         return "\n".join(blocks)
+
+    @staticmethod
+    def _source_duration(
+        durations: float | dict[str, float],
+        source_asset_id: Optional[str],
+    ) -> float:
+        if isinstance(durations, dict):
+            if source_asset_id is None and len(durations) == 1:
+                return float(next(iter(durations.values())))
+            return float(durations.get(source_asset_id or "", 0.0))
+        return float(durations)
 
     @staticmethod
     def _srt_time(seconds: float) -> str:

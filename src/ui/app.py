@@ -17,6 +17,7 @@ app.py — Gradio Web 界面
 import html
 import json
 import math
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -28,14 +29,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import gradio as gr  # noqa: E402
 from src.orchestrator import VideoEditOrchestrator  # noqa: E402
 from src.models.schemas import PipelineStatus  # noqa: E402
-from src.config import GRADIO_SERVER_PORT  # noqa: E402
-from src.tools.ffmpeg import FFmpegTool  # noqa: E402
+from src.config import (  # noqa: E402
+    GRADIO_SERVER_NAME,
+    GRADIO_SERVER_PORT,
+    MOBILE_REVIEW_BASE_URL,
+)
 
 
 # 运行时组件只加载一次；每个任务拥有独立 Orchestrator 状态和任务目录。
 _runtime = None
 _task_orchestrators = {}
-MAX_CANDIDATE_CARDS = 12
+MAX_CANDIDATE_CARDS = 18
 
 
 PRIORITY_LABELS = {
@@ -74,6 +78,19 @@ def _format_seconds(value):
     return f"{minutes:02d}:{remainder:04.1f}"
 
 
+def _source_name(orch, source_asset_id):
+    material_set = getattr(orch.status, "material_set", None)
+    if material_set:
+        match = next(
+            (item for item in material_set.sources if item.id == source_asset_id), None
+        )
+        if match:
+            return match.filename
+        if source_asset_id is None and len(material_set.sources) == 1:
+            return material_set.sources[0].filename
+    return "原素材"
+
+
 def get_runtime():
     """延迟加载 Whisper 等昂贵组件。"""
     global _runtime
@@ -88,15 +105,22 @@ def _new_task_orchestrator():
     orchestrator.agent1 = runtime.agent1
     orchestrator.clarification_agent = runtime.clarification_agent
     orchestrator.alignment_agent = runtime.alignment_agent
+    orchestrator.material_interview_agent = runtime.material_interview_agent
     orchestrator.agent2 = runtime.agent2
     orchestrator.candidate_agent = runtime.candidate_agent
     orchestrator.style_agent = runtime.style_agent
     orchestrator.agent3 = runtime.agent3
     orchestrator.agent4 = runtime.agent4
     orchestrator.plan_service = runtime.plan_service
+    orchestrator.media_asset_service = runtime.media_asset_service
+    orchestrator.timeline_compiler = runtime.timeline_compiler
+    orchestrator.reference_document_service = runtime.reference_document_service
+    orchestrator.mobile_review_service = runtime.mobile_review_service
     orchestrator.clarification_service = runtime.clarification_service
     orchestrator.verification_engine = runtime.verification_engine
     orchestrator.render_backend = runtime.render_backend
+    orchestrator.metadata_repository = runtime.metadata_repository
+    orchestrator.idempotency_backend = None
     orchestrator.status = PipelineStatus(step="init")
     orchestrator.task_dir = None
     orchestrator.store = None
@@ -174,7 +198,7 @@ def _requirement_review_markdown(spec, execution, warnings=None, saved=False):
     return f"""
 ## 剪辑任务书 v{spec.version}
 
-请确认下面的目标和内容取舍是否符合你的意思。确认前，AI 不会开始分析整段素材。{saved_notice}
+请确认下面的目标和内容取舍是否符合你的意思。系统已完成素材的独立转录与初步理解；确认后才会正式选择候选片段。{saved_notice}
 
 {warning_block}
 
@@ -203,6 +227,44 @@ def _requirement_review_markdown(spec, execution, warnings=None, saved=False):
 
 确认无误后，点击下方“确认任务书并分析素材”。
 """
+
+
+def _material_set_markdown(orch):
+    """用文件名和业务状态展示独立素材处理结果，不暴露内部素材 ID。"""
+    material_set = orch.status.material_set
+    if material_set is None:
+        return ""
+    status_labels = {
+        "ready": "已完成转录与理解",
+        "no_audio": "没有音轨，可用于人工补片",
+        "failed": "处理失败，可单独重试",
+        "transcribing": "正在转录",
+        "preflight_ok": "等待转录",
+        "pending": "等待处理",
+        "excluded": "已排除",
+    }
+    result_by_source = {item.source.id: item for item in material_set.results}
+    rows = []
+    for source in material_set.sources:
+        result = result_by_source.get(source.id)
+        state = result.status if result else source.analysis_state
+        summary = (
+            result.analysis.summary.strip()
+            if result and result.analysis and result.analysis.summary.strip()
+            else "—"
+        )
+        rows.append(
+            f"| {source.order} | {html.escape(source.filename)} | "
+            f"{status_labels.get(state, '等待处理')} | {_human_duration(source.duration)} | "
+            f"{html.escape(summary[:120])} |"
+        )
+    return (
+        "### 本次素材处理结果\n\n"
+        "每段素材保留自己的时间线；只有批准剪辑方案后才组合选中片段。\n\n"
+        "| 顺序 | 来源文件 | 状态 | 时长 | 内容概览 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        + "\n".join(rows)
+    )
 
 
 def _material_alignment_markdown(proposal):
@@ -360,12 +422,14 @@ def load_candidate_cards(plan_state):
         if index < len(segments):
             segment = segments[index]
             duration = segment.source_end - segment.source_start
+            source_name = _source_name(orch, segment.source_asset_id)
             group_updates.append(gr.update(visible=True))
             header_updates.append(
                 gr.update(
                     value=(
                         f"### 片段 {index + 1}\n"
-                        f"原素材 {_format_seconds(segment.source_start)}–"
+                        f"来源：**{html.escape(source_name)}** · "
+                        f"{_format_seconds(segment.source_start)}–"
                         f"{_format_seconds(segment.source_end)}，约 {duration:.1f} 秒"
                     )
                 )
@@ -469,10 +533,16 @@ def _manual_segment_payloads(rows, spec, selected_count):
         row = list(raw_row or [])
         if not row or all(_is_blank_cell(value) for value in row):
             continue
+        has_source = (
+            len(row) >= 9
+            and isinstance(row[0], str)
+            and row[0].startswith("asset_")
+        )
+        offset = 2 if has_source else 0
         # Gradio 的 number 列会把默认空白单元格提交为 0；整行 0/0/0
         # 且其余字段为空时只是占位行，不代表用户添加了 0 秒片段。
-        numeric_placeholders = row[:3] + [0] * max(0, 3 - len(row))
-        remaining_cells = row[3:]
+        numeric_placeholders = row[offset:offset + 3] + [0] * max(0, 3 - len(row[offset:]))
+        remaining_cells = row[offset + 3:]
         try:
             is_default_placeholder = (
                 all(float(value) == 0 for value in numeric_placeholders)
@@ -482,13 +552,14 @@ def _manual_segment_payloads(rows, spec, selected_count):
             is_default_placeholder = False
         if is_default_placeholder:
             continue
-        start = row[0] if len(row) > 0 else None
-        end = row[1] if len(row) > 1 else None
+        start = row[offset] if len(row) > offset else None
+        end = row[offset + 1] if len(row) > offset + 1 else None
         if _is_blank_cell(start) or _is_blank_cell(end):
             raise ValueError("人工补片未填写完整：请同时填写开始和结束时间，或者清空这一行")
-        order = row[2] if len(row) > 2 else None
-        requirement_numbers = row[3] if len(row) > 3 else ""
+        order = row[offset + 2] if len(row) > offset + 2 else None
+        requirement_numbers = row[offset + 3] if len(row) > offset + 3 else ""
         segments.append({
+            "source_asset_id": row[0] if has_source else None,
             "source_start": float(start),
             "source_end": float(end),
             "order": (
@@ -498,16 +569,16 @@ def _manual_segment_payloads(rows, spec, selected_count):
             ),
             "matched_requirement_ids": _requirement_ids_from_numbers(requirement_numbers, spec),
             "annotation": (
-                str(row[4]).strip()
-                if len(row) > 4 and not _is_blank_cell(row[4]) else ""
+                str(row[offset + 4]).strip()
+                if len(row) > offset + 4 and not _is_blank_cell(row[offset + 4]) else ""
             ),
             "subtitle_text": (
-                str(row[5]).strip()
-                if len(row) > 5 and not _is_blank_cell(row[5]) else None
+                str(row[offset + 5]).strip()
+                if len(row) > offset + 5 and not _is_blank_cell(row[offset + 5]) else None
             ),
             "title_text": (
-                str(row[6]).strip()
-                if len(row) > 6 and not _is_blank_cell(row[6]) else None
+                str(row[offset + 6]).strip()
+                if len(row) > offset + 6 and not _is_blank_cell(row[offset + 6]) else None
             ),
         })
     return segments
@@ -551,16 +622,23 @@ def _manual_segments_markdown(rows):
         return "尚未补入片段。拖动上方时间线并点击“加入时间线”即可。"
     lines = ["### 已补入的片段"]
     for index, row in enumerate(rows, start=1):
-        requirement_text = str(row[3]).replace(",", "、") if len(row) > 3 else ""
-        note = str(row[4]).strip() if len(row) > 4 and row[4] else "未填写说明"
+        has_source = len(row) >= 9 and str(row[0]).startswith("asset_")
+        offset = 2 if has_source else 0
+        source_text = f"｜来源 {html.escape(str(row[1]))}" if has_source else ""
+        requirement_text = str(row[offset + 3]).replace(",", "、") if len(row) > offset + 3 else ""
+        note = str(row[offset + 4]).strip() if len(row) > offset + 4 and row[offset + 4] else "未填写说明"
         lines.append(
-            f"{index}. **{_format_seconds(row[0])} — {_format_seconds(row[1])}**"
-            f"（{float(row[1]) - float(row[0]):.1f} 秒）｜对应要求 {requirement_text}｜{html.escape(note)}"
+            f"{index}. **{_format_seconds(row[offset])} — {_format_seconds(row[offset + 1])}**"
+            f"（{float(row[offset + 1]) - float(row[offset]):.1f} 秒）{source_text}"
+            f"｜对应要求 {requirement_text}｜{html.escape(note)}"
         )
     return "\n\n".join(lines)
 
 
-def append_manual_segment(rows, start, end, requirement_numbers, annotation, subtitle, title):
+def append_manual_segment(
+    rows, start, end, requirement_numbers, annotation, subtitle, title,
+    plan_state=None, source_asset_id=None,
+):
     """把用户拖动选中的区间加入补片列表，不要求手工填写秒数。"""
     start_value = float(start or 0)
     end_value = float(end or 0)
@@ -570,16 +648,38 @@ def append_manual_segment(rows, start, end, requirement_numbers, annotation, sub
     if not selected_requirements:
         raise gr.Error("请至少勾选一条这段内容对应的任务书要求")
     updated = [list(row) for row in (rows or [])]
-    updated.append([
-        start_value,
-        end_value,
-        None,
-        ",".join(selected_requirements),
-        str(annotation or "").strip(),
-        str(subtitle or "").strip(),
+    values = [
+        start_value, end_value, None, ",".join(selected_requirements),
+        str(annotation or "").strip(), str(subtitle or "").strip(),
         str(title or "").strip(),
-    ])
+    ]
+    if source_asset_id:
+        source_name = str(source_asset_id)
+        try:
+            orch = _get_task_orchestrator(plan_state)
+            source_name = _source_name(orch, source_asset_id)
+        except Exception:
+            pass
+        values = [source_asset_id, source_name, *values]
+    updated.append(values)
     return updated, _manual_segments_markdown(updated)
+
+
+def select_manual_source(plan_state, source_asset_id):
+    """切换人工补片所预览的独立原素材，并同步滑块范围。"""
+    if not plan_state or not source_asset_id:
+        return gr.update(), gr.update(), gr.update()
+    orch = _get_task_orchestrator(plan_state)
+    source = next(
+        item for item in orch.status.material_set.sources
+        if item.id == source_asset_id
+    )
+    default_end = min(15.0, source.duration)
+    return (
+        gr.update(value=source.source_path, visible=True),
+        gr.update(minimum=0, maximum=source.duration, value=0, visible=True),
+        gr.update(minimum=0, maximum=source.duration, value=default_end, visible=True),
+    )
 
 
 def undo_manual_segment(rows):
@@ -612,7 +712,7 @@ def _pending_clarification_slots(orch):
         if explanation:
             display += "｜" + "｜".join(explanation)
         pending.append((slot.key, display, slot.answer_hint))
-    return pending[:3]
+    return pending[:5]
 
 
 def load_clarification_questions(workflow_state):
@@ -823,7 +923,7 @@ def _review_markdown(orch):
         generation = json.loads(
             (orch.task_dir / "candidate_generation.json").read_text(encoding="utf-8")
         )
-    except (OSError, ValueError, TypeError):
+    except (AttributeError, OSError, ValueError, TypeError):
         generation = {}
     failed_descriptions = [
         requirement_by_id[item_id]
@@ -859,7 +959,8 @@ def _review_markdown(orch):
                 risks.append("需要人工复核")
         risk = "；".join(dict.fromkeys(risks)) or "证据与时间范围已通过自动检查"
         candidate_cards.append(
-            f"### 片段 {index} · {_format_seconds(candidate.source_start)}–{_format_seconds(candidate.source_end)}\n\n"
+            f"### 片段 {index} · {html.escape(_source_name(orch, candidate.source_asset_id))} · "
+            f"{_format_seconds(candidate.source_start)}–{_format_seconds(candidate.source_end)}\n\n"
             f"**对应要求：** {matched}\n\n"
             f"**为什么建议保留：** {html.escape(candidate.selection_reason)}\n\n"
             f"**可核验原文：**\n\n{citations}\n\n"
@@ -911,13 +1012,14 @@ def _review_markdown(orch):
         )
     timeline_rows = "\n".join(
         f"| {segment.order} | 片段 {candidate_number_by_id.get(segment.candidate_id, segment.order)} | "
+        f"{html.escape(_source_name(orch, segment.source_asset_id))} | "
         f"{_format_seconds(segment.source_start)}–{_format_seconds(segment.source_end)} | "
         f"{_format_seconds(segment.output_start)}–{_format_seconds(segment.output_end)} | "
         f"{html.escape(segment.subtitle_text or '跟随转录')} |"
         for segment in plan.timeline_segments
     )
     return f"""
-## 合并方案审核页
+## 剪辑方案审核页
 
 任务书 v{spec.version}：{html.escape(spec.purpose)}；受众：{html.escape(spec.audience)}；目标 {spec.target_duration:.0f}±{spec.duration_tolerance:.0f} 秒。
 
@@ -939,8 +1041,8 @@ def _review_markdown(orch):
 {f'{chr(10)}{chr(10)}---{chr(10)}{chr(10)}'.join(candidate_cards)}
 
 ### 粗剪时间线 v{plan.version}
-| 顺序 | 片段 | 原素材时间 | 成片时间 | 字幕 |
-| --- | --- | --- | --- | --- |
+| 顺序 | 片段 | 来源素材 | 原素材时间 | 成片时间 | 字幕 |
+| --- | --- | --- | --- | --- | --- |
 {timeline_rows}
 
 预计成片时长：{plan.estimated_duration:.1f} 秒。请在下方“片段与时间线”中保留、删除、排序、修剪或修改字幕，然后点击“确认方案并生成成片”。
@@ -1015,10 +1117,25 @@ def _duration_action_markdown(orch):
         item for item in spec.requirements
         if item.priority == "must" and item.id not in covered
     ]
+    recommendations = []
+    try:
+        duration_plan = json.loads(
+            (orch.task_dir / "duration_budget.json").read_text(encoding="utf-8")
+        )
+        recommendations = duration_plan.get("recommendations", [])
+    except (AttributeError, OSError, ValueError, TypeError):
+        recommendations = []
+    recommendation_text = (
+        "\n\n**AI 的补足建议：**\n" + "\n".join(
+            f"- {html.escape(str(item))}" for item in recommendations
+        )
+        if recommendations else ""
+    )
     if missing_seconds <= 0:
         return (
             f"✅ 当前预计 **{plan.estimated_duration:.1f} 秒**，已达到任务书允许的最低时长 "
-            f"**{lower:.1f} 秒**。如果 AI 仍有漏选，也可以在下方人工补入片段。",
+            f"**{lower:.1f} 秒**。如果 AI 仍有漏选，也可以在下方人工补入片段。"
+            f"{recommendation_text}",
             False,
         )
     if missing_must:
@@ -1032,7 +1149,8 @@ def _duration_action_markdown(orch):
         f"⚠️ 当前预计 **{plan.estimated_duration:.1f} 秒**，比任务书允许的最低时长 "
         f"**{lower:.1f} 秒**少约 **{missing_seconds:.1f} 秒**。你可以：\n\n"
         "1. 如果现有内容已经完整，点击“接受当前时长并生成”；系统会记录这次人工例外。\n"
-        "2. 如果还缺内容，直接在下方播放原素材、拖动选段范围并加入时间线。",
+        "2. 如果还缺内容，直接在下方播放原素材、拖动选段范围并加入时间线。"
+        f"{recommendation_text}",
         True,
     )
 
@@ -1086,11 +1204,7 @@ def create_requirement_review(
             compilation.execution_brief,
             warnings=compilation.warnings,
         )
-        if len(video_paths) > 1:
-            summary = (
-                f"> ✅ 已按上传顺序将 **{len(video_paths)} 段素材**合成为一条分析时间线。\n\n"
-                + summary
-            )
+        summary = _material_set_markdown(orch) + "\n\n" + summary
         return (
             summary,
             {
@@ -1197,7 +1311,7 @@ def confirm_and_analyze(
     if not workflow_state:
         return (
             "请先创建需求任务书", gr.update(), None,
-            *[gr.update() for _ in range(12)],
+            *[gr.update() for _ in range(13)],
         )
     try:
         orch = _get_task_orchestrator(workflow_state)
@@ -1230,7 +1344,7 @@ def confirm_and_analyze(
                 workflow_state,
                 gr.update(visible=False),
                 gr.update(choices=[], visible=False),
-                *[gr.update(visible=False) for _ in range(5)],
+                *[gr.update(visible=False) for _ in range(6)],
                 *[gr.update() for _ in range(5)],
             )
         progress(1.0, desc="请审核有证据的候选片段")
@@ -1246,9 +1360,11 @@ def confirm_and_analyze(
             for index, proposal in enumerate(orch.status.style_proposals, start=1)
         ]
         duration_markdown, can_accept_short = _duration_action_markdown(orch)
-        media_info = FFmpegTool.get_video_info(workflow_state["video_path"]) or {}
-        source_duration = max(0.1, float(media_info.get("duration", 0.1)))
+        sources = list(orch.status.material_set.sources) if orch.status.material_set else []
+        first_source = sources[0] if sources else None
+        source_duration = max(0.1, first_source.duration if first_source else 0.1)
         default_end = min(15.0, source_duration)
+        source_choices = [(item.filename, item.id) for item in sources]
         return (
             _review_markdown(orch),
             _timeline_rows(orch.status.edit_plan),
@@ -1259,7 +1375,15 @@ def confirm_and_analyze(
             gr.update(value=duration_markdown),
             gr.update(visible=can_accept_short),
             gr.update(visible=True),
-            gr.update(value=workflow_state["video_path"], visible=True),
+            gr.update(
+                choices=source_choices,
+                value=first_source.id if first_source else None,
+                visible=bool(source_choices),
+            ),
+            gr.update(
+                value=first_source.source_path if first_source else workflow_state["video_path"],
+                visible=True,
+            ),
             gr.update(minimum=0, maximum=source_duration, value=0, visible=True),
             gr.update(minimum=0, maximum=source_duration, value=default_end, visible=True),
             gr.update(choices=_manual_requirement_choices(orch.status.requirement_spec), value=[]),
@@ -1271,9 +1395,73 @@ def confirm_and_analyze(
         return (
             f"## 分析失败\n\n{html.escape(str(error))}", [], workflow_state,
             gr.update(visible=False), gr.update(),
-            *[gr.update(visible=False) for _ in range(5)],
+            *[gr.update(visible=False) for _ in range(6)],
             *[gr.update() for _ in range(5)],
         )
+
+
+def _revise_plan_from_review_controls(
+    plan_state,
+    timeline_rows,
+    manual_segment_rows,
+    style_bundle_id,
+    bgm_path,
+    bgm_volume,
+    transition_duration,
+    subtitle_style,
+    intro_style,
+    outro_style,
+    title_text,
+):
+    """把当前界面选择保存为新计划版本，供本地或手机审核复用。"""
+    if not plan_state:
+        raise ValueError("请先生成剪辑方案")
+    orch = _get_task_orchestrator(plan_state)
+    selected_ids = []
+    updates = {}
+    candidate_labels = plan_state.get("candidate_labels", {})
+    for row in timeline_rows or []:
+        if len(row) < 5 or not _truthy(row[0]):
+            continue
+        label = str(row[2]).strip()
+        candidate_id = candidate_labels.get(label)
+        if not candidate_id:
+            raise ValueError(f"无法识别“{label}”，请不要修改片段名称")
+        selected_ids.append(candidate_id)
+        updates[candidate_id] = {
+            "order": int(float(row[1])),
+            "source_start": float(row[3]),
+            "source_end": float(row[4]),
+            "subtitle_text": str(row[5]).strip() or None if len(row) > 5 else None,
+            "title_text": str(row[6]).strip() or None if len(row) > 6 else None,
+        }
+    delivery_updates = {
+        "transition_duration": float(transition_duration),
+        "subtitle_style": subtitle_style,
+        "bgm_path": bgm_path,
+        "bgm_volume": float(bgm_volume),
+        "intro_style": intro_style,
+        "outro_style": outro_style,
+        "title_text": title_text,
+        "style_bundle_id": style_bundle_id or None,
+    }
+    if style_bundle_id:
+        delivery_updates.update(orch.style_agent.catalog.bundle_config(style_bundle_id))
+    manual_segments = _manual_segment_payloads(
+        manual_segment_rows,
+        orch.status.requirement_spec,
+        len(selected_ids),
+    )
+    if not selected_ids and not manual_segments:
+        raise ValueError("请至少保留或人工添加一个片段")
+    revised = orch.revise_edit_plan(
+        selected_candidate_ids=selected_ids,
+        segment_updates=updates,
+        manual_segments=manual_segments,
+        delivery_updates=delivery_updates,
+        actor_id="local-user",
+    )
+    return orch, revised
 
 
 def render_confirmed(
@@ -1296,50 +1484,18 @@ def render_confirmed(
         return "请先生成剪辑方案", None, gr.update(), gr.update(), gr.update()
     try:
         progress(0.1, desc="正在应用你的片段选择...")
-        orch = _get_task_orchestrator(plan_state)
-        selected_ids = []
-        updates = {}
-        candidate_labels = plan_state.get("candidate_labels", {})
-        for row in timeline_rows or []:
-            if len(row) < 5 or not _truthy(row[0]):
-                continue
-            label = str(row[2]).strip()
-            candidate_id = candidate_labels.get(label)
-            if not candidate_id:
-                raise ValueError(f"无法识别“{label}”，请不要修改片段名称")
-            selected_ids.append(candidate_id)
-            updates[candidate_id] = {
-                "order": int(float(row[1])),
-                "source_start": float(row[3]),
-                "source_end": float(row[4]),
-                "subtitle_text": str(row[5]).strip() or None if len(row) > 5 else None,
-                "title_text": str(row[6]).strip() or None if len(row) > 6 else None,
-            }
-        delivery_updates = {
-            "transition_duration": float(transition_duration),
-            "subtitle_style": subtitle_style,
-            "bgm_path": bgm_path,
-            "bgm_volume": float(bgm_volume),
-            "intro_style": intro_style,
-            "outro_style": outro_style,
-            "title_text": title_text,
-            "style_bundle_id": style_bundle_id or None,
-        }
-        if style_bundle_id:
-            delivery_updates.update(orch.style_agent.catalog.bundle_config(style_bundle_id))
-        manual_segments = _manual_segment_payloads(
+        orch, revised = _revise_plan_from_review_controls(
+            plan_state,
+            timeline_rows,
             manual_segment_rows,
-            orch.status.requirement_spec,
-            len(selected_ids),
-        )
-        if not selected_ids and not manual_segments:
-            raise ValueError("请至少保留或人工添加一个片段")
-        revised = orch.revise_edit_plan(
-            selected_candidate_ids=selected_ids,
-            segment_updates=updates,
-            manual_segments=manual_segments,
-            delivery_updates=delivery_updates,
-            actor_id="local-user",
+            style_bundle_id,
+            bgm_path,
+            bgm_volume,
+            transition_duration,
+            subtitle_style,
+            intro_style,
+            outro_style,
+            title_text,
         )
         approved = orch.approve_current_plan(
             "local-user",
@@ -1395,6 +1551,124 @@ def render_short_confirmed(
     )
 
 
+def create_mobile_review_from_controls(
+    plan_state,
+    timeline_rows,
+    manual_segment_rows,
+    style_bundle_id,
+    bgm_path,
+    bgm_volume,
+    transition_duration,
+    subtitle_style,
+    intro_style,
+    outro_style,
+    title_text,
+    ttl_hours,
+):
+    """保存当前界面版本并生成手机可访问的短期审核链接和二维码。"""
+    try:
+        orch, revised = _revise_plan_from_review_controls(
+            plan_state,
+            timeline_rows,
+            manual_segment_rows,
+            style_bundle_id,
+            bgm_path,
+            bgm_volume,
+            transition_duration,
+            subtitle_style,
+            intro_style,
+            outro_style,
+            title_text,
+        )
+        link = orch.create_mobile_review_link(
+            base_url=MOBILE_REVIEW_BASE_URL,
+            ttl_hours=int(ttl_hours),
+            actor_id="local-user",
+        )
+        updated_state = {
+            **plan_state,
+            "plan_id": revised.id,
+            "plan_version": revised.version,
+        }
+        return (
+            "### 手机审核链接已生成\n\n"
+            f"[在手机打开剪辑方案 v{revised.version}]({link.url})\n\n"
+            f"链接将在 {link.expires_at.astimezone().strftime('%m月%d日 %H:%M')} 失效。"
+            "请确保手机能访问上面显示的电脑地址；手机提交后，再点击“读取审核结果并生成”。",
+            gr.update(value=link.qr_code_path, visible=bool(link.qr_code_path)),
+            updated_state,
+        )
+    except Exception as error:
+        return (
+            f"### 手机审核链接生成失败\n\n{html.escape(str(error))}",
+            gr.update(visible=False),
+            plan_state,
+        )
+
+
+def apply_mobile_review_and_render(plan_state, progress=gr.Progress()):
+    """读取当前计划版本的手机决定；只有批准后才渲染。"""
+    if not plan_state:
+        return "请先生成手机审核链接", None, gr.update(), gr.update(), gr.update()
+    try:
+        progress(0.2, desc="正在读取手机审核结果...")
+        orch = _get_task_orchestrator(plan_state)
+        submission = orch.apply_latest_mobile_review()
+        if submission.decision != "approve":
+            return (
+                "## 审核者已退回修改\n\n"
+                + html.escape(submission.comment or "请根据审核意见修改当前剪辑方案。"),
+                None,
+                gr.update(),
+                gr.update(),
+                gr.update(),
+            )
+        result = orch.render_approved_plan(
+            orch.status.edit_plan,
+            plan_state["video_path"],
+        )
+        progress(1.0, desc="完成！")
+        if not result.success:
+            return (
+                "## 导出失败\n\n" + "\n".join(f"- {item}" for item in result.errors),
+                None,
+                gr.update(),
+                gr.update(),
+                gr.update(),
+            )
+        needs_resolution = bool(
+            orch.status.delivery_report
+            and orch.status.delivery_report.status == "needs_resolution"
+        )
+        return (
+            f"## 手机审核已批准，渲染完成\n\n实际时长：{result.output_duration:.1f} 秒。\n\n"
+            f"{_delivery_markdown(orch.status.delivery_report)}",
+            result.output_path,
+            gr.update(value=orch.status.edit_plan.execution_script.srt_subtitles, visible=True),
+            gr.update(visible=needs_resolution, value=""),
+            gr.update(visible=needs_resolution),
+        )
+    except Exception as error:
+        return (
+            f"## 尚未取得可用的手机审核结果\n\n{html.escape(str(error))}",
+            None,
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
+
+
+def revoke_mobile_review(plan_state):
+    if not plan_state:
+        return "请先生成手机审核链接", gr.update(visible=False)
+    try:
+        orch = _get_task_orchestrator(plan_state)
+        orch.revoke_latest_mobile_review_link(actor_id="local-user")
+        return "✅ 当前手机审核链接已撤销。", gr.update(visible=False, value=None)
+    except Exception as error:
+        return f"撤销失败：{html.escape(str(error))}", gr.update()
+
+
 def resolve_delivery_exception(plan_state, reason):
     if not plan_state:
         return "请先完成渲染", gr.update(), gr.update()
@@ -1404,6 +1678,65 @@ def resolve_delivery_exception(plan_state, reason):
         return _delivery_markdown(report), gr.update(visible=False), gr.update(visible=False)
     except Exception as error:
         return f"## 交付异常处理失败\n\n{html.escape(str(error))}", gr.update(), gr.update()
+
+
+def upload_reference_documents(plan_state, files, category_label):
+    """加入活动资料，并报告可定位证据与待核对专有名词数量。"""
+    if not plan_state:
+        return "请先上传视频并生成任务书。"
+    paths = _uploaded_video_paths(files)
+    if not paths:
+        return "请选择至少一份活动资料。"
+    category_map = {
+        "活动流程表": "agenda", "主持稿": "host_script",
+        "人员与职务名单": "people", "奖项名单": "awards",
+        "产品名称": "products", "组织与合作单位": "organizations",
+        "专用术语": "terminology", "其他资料": "other",
+    }
+    try:
+        orch = _get_task_orchestrator(plan_state)
+        library = None
+        for path in paths:
+            library = orch.add_reference_document(
+                path,
+                category_map.get(category_label, "other"),
+                actor_id="local-user",
+            )
+        pending = 0
+        queue_path = orch.task_dir / "entity_review_queue.json"
+        if queue_path.exists():
+            queue = json.loads(queue_path.read_text(encoding="utf-8"))
+            pending = sum(
+                item.get("status") == "pending" for item in queue.get("items", [])
+            )
+        return (
+            f"✅ 已加入 {len(paths)} 份资料；当前共有 "
+            f"{len(library.evidence) if library else 0} 条可定位文字证据。"
+            f"待人工核对的专有名词：{pending} 项。系统不会静默改写字幕。"
+        )
+    except Exception as error:
+        return f"资料处理失败：{html.escape(str(error))}"
+
+
+def export_editor_handoff(plan_state, adapter):
+    """把已批准时间线导出为剪映交接包或 OTIO。"""
+    if not plan_state:
+        return "请先生成并批准剪辑方案。", None
+    try:
+        orch = _get_task_orchestrator(plan_state)
+        result = orch.export_editor_package(adapter)
+        if not result.success:
+            return "导出失败：" + "；".join(result.errors), None
+        if adapter == "jianying":
+            archive_path = shutil.make_archive(
+                str(Path(result.output_path).with_suffix("")),
+                "zip",
+                root_dir=result.output_path,
+            )
+            return "✅ 剪映交接包已生成，含顺序片段、字幕、清单和导入说明。", archive_path
+        return "✅ OTIO 时间线已生成，可供兼容工具继续转换。", result.output_path
+    except Exception as error:
+        return f"导出失败：{html.escape(str(error))}", None
 
 
 def create_ui():
@@ -1906,7 +2239,7 @@ def create_ui():
                     type="filepath",
                 )
                 gr.Markdown(
-                    "支持手机、相机和电脑素材；多段视频将按列表顺序拼接。",
+                    "支持手机、相机和电脑素材；多段视频会分别转录和分析，只有入选片段在导出时组合。",
                     elem_classes=["upload-note"],
                 )
             with gr.Column(scale=7, elem_classes=["intake-column"]):
@@ -2048,6 +2381,27 @@ def create_ui():
             elem_classes=["action-status"],
         )
 
+        with gr.Accordion("📎 活动流程表、名单与术语资料（可选）", open=False):
+            gr.Markdown(
+                "可在任务书确认前上传。资料会保留行或单元格出处，只用于检索和生成待确认建议。"
+            )
+            reference_category = gr.Dropdown(
+                choices=[
+                    "活动流程表", "主持稿", "人员与职务名单", "奖项名单",
+                    "产品名称", "组织与合作单位", "专用术语", "其他资料",
+                ],
+                value="活动流程表",
+                label="资料类型",
+            )
+            reference_files = gr.File(
+                label="上传 TXT、Markdown、CSV 或 JSON",
+                file_count="multiple",
+                file_types=[".txt", ".md", ".csv", ".json"],
+                type="filepath",
+            )
+            add_reference_btn = gr.Button("加入本次任务的参考资料")
+            reference_status = gr.Markdown("尚未上传活动资料。")
+
         with gr.Accordion("🎨 成品样式与声音（确认任务书后可调整）", open=False):
             gr.Markdown("这些设置只影响最终成片，不会遮挡或改变上方任务书。")
             style = gr.Dropdown(
@@ -2111,6 +2465,11 @@ def create_ui():
             gr.Markdown(
                 "### ➕ 从原素材补入片段\n\n"
                 "播放原视频定位内容，再拖动开始和结束滑块选择范围；不需要手写时间。"
+            )
+            manual_source_selector = gr.Dropdown(
+                choices=[],
+                label="先选择要补片的来源素材",
+                visible=False,
             )
             manual_source_preview = gr.Video(
                 label="原素材｜拖动进度条寻找要补入的内容",
@@ -2193,10 +2552,11 @@ def create_ui():
                                 precision=0,
                                 label="在成片中的顺序",
                             )
-                        gr.Markdown("**只在需要微调片段边界时修改下面两个时间。**")
-                        with gr.Row():
-                            candidate_start = gr.Number(label="从原视频第几秒开始", precision=2)
-                            candidate_end = gr.Number(label="到原视频第几秒结束", precision=2)
+                        with gr.Accordion("高级：微调片段边界", open=False):
+                            gr.Markdown("通常无需修改；只有预览多出或缺少一句话时再调整。")
+                            with gr.Row():
+                                candidate_start = gr.Number(label="开始位置（秒）", precision=2)
+                                candidate_end = gr.Number(label="结束位置（秒）", precision=2)
                         candidate_subtitle = gr.Textbox(
                             label="字幕",
                             placeholder="留空则沿用语音识别字幕；需要纠错时直接填写。",
@@ -2231,6 +2591,29 @@ def create_ui():
                 visible=False,
                 elem_classes=["primary-action"],
             )
+            with gr.Accordion("也可以发到手机审核", open=False):
+                gr.Markdown(
+                    "系统会先保存你在本页的片段、顺序、字幕和样式，再生成只绑定这个版本的短期链接。"
+                    "审核者只能批准或退回，不能在手机上剪片。"
+                )
+                mobile_ttl = gr.Radio(
+                    choices=[("24 小时", 24), ("3 天", 72), ("7 天", 168)],
+                    value=24,
+                    label="链接有效期",
+                )
+                with gr.Row():
+                    create_mobile_review_btn = gr.Button("生成手机审核链接")
+                    apply_mobile_review_btn = gr.Button("读取审核结果并生成")
+                    revoke_mobile_review_btn = gr.Button("撤销链接")
+                mobile_review_status = gr.Markdown(
+                    "需要同时启动手机审核服务，并把手机和电脑连接到可互相访问的网络。"
+                )
+                mobile_review_qr = gr.Image(
+                    label="手机扫码审核",
+                    visible=False,
+                    interactive=False,
+                    height=220,
+                )
 
         gr.Markdown(
             """
@@ -2260,6 +2643,17 @@ def create_ui():
                     lines=5,
                     visible=False,
                 )
+
+        with gr.Group(elem_classes=["export-action"]):
+            gr.Markdown(
+                "### 交给其他剪辑软件继续精修\n"
+                "剪映使用稳定交接包；Premiere、Resolve 等可从 OTIO 继续转换。"
+            )
+            with gr.Row():
+                export_jianying_btn = gr.Button("下载剪映交接包")
+                export_otio_btn = gr.Button("下载 OTIO 时间线")
+            editor_export_status = gr.Markdown("请先批准并生成当前方案。")
+            editor_export_file = gr.File(label="编辑器交接文件")
 
         gr.Markdown(
             """
@@ -2303,6 +2697,12 @@ def create_ui():
                 clarification_confirmation_state,
                 *clarification_confirmation_statuses,
             ],
+            api_name=False,
+        )
+        add_reference_btn.click(
+            fn=upload_reference_documents,
+            inputs=[plan_state, reference_files, reference_category],
+            outputs=[reference_status],
             api_name=False,
         )
         questions_loaded.then(
@@ -2439,6 +2839,7 @@ def create_ui():
                 duration_action_text,
                 accept_short_btn,
                 manual_segment_group,
+                manual_source_selector,
                 manual_source_preview,
                 manual_range_start,
                 manual_range_end,
@@ -2479,6 +2880,13 @@ def create_ui():
                 queue=False,
                 api_name=False,
             )
+        manual_source_selector.change(
+            fn=select_manual_source,
+            inputs=[plan_state, manual_source_selector],
+            outputs=[manual_source_preview, manual_range_start, manual_range_end],
+            queue=False,
+            api_name=False,
+        )
         add_manual_segment_btn.click(
             fn=append_manual_segment,
             inputs=[
@@ -2489,6 +2897,8 @@ def create_ui():
                 manual_annotation,
                 manual_subtitle,
                 manual_title,
+                plan_state,
+                manual_source_selector,
             ],
             outputs=[manual_segment_editor, manual_segment_summary],
             queue=False,
@@ -2543,6 +2953,62 @@ def create_ui():
             ],
             api_name=False,
         )
+        mobile_candidate_rows_collected = create_mobile_review_btn.click(
+            fn=candidate_cards_to_rows,
+            inputs=[
+                component
+                for fields in zip(
+                    candidate_decisions,
+                    candidate_orders,
+                    candidate_starts,
+                    candidate_ends,
+                    candidate_subtitles,
+                    candidate_titles,
+                )
+                for component in fields
+            ],
+            outputs=[timeline_state],
+            queue=False,
+            api_name=False,
+        )
+        mobile_candidate_rows_collected.then(
+            fn=create_mobile_review_from_controls,
+            inputs=[
+                plan_state,
+                timeline_state,
+                manual_segment_editor,
+                style_proposal_selector,
+                bgm_input,
+                bgm_volume,
+                transition_duration,
+                subtitle_style,
+                intro_style,
+                outro_style,
+                title_text,
+                mobile_ttl,
+            ],
+            outputs=[mobile_review_status, mobile_review_qr, plan_state],
+            api_name=False,
+        )
+        apply_mobile_review_btn.click(
+            fn=apply_mobile_review_and_render,
+            inputs=[plan_state],
+            outputs=[
+                delivery_result_text,
+                output_video,
+                subtitle_output,
+                exception_reason,
+                approve_exception_btn,
+            ],
+            api_name=False,
+        )
+        revoke_mobile_review_btn.click(
+            fn=revoke_mobile_review,
+            inputs=[plan_state],
+            outputs=[mobile_review_status, mobile_review_qr],
+            queue=False,
+            api_name=False,
+        )
         short_candidate_rows_collected = accept_short_btn.click(
             fn=candidate_cards_to_rows,
             inputs=[
@@ -2591,6 +3057,18 @@ def create_ui():
             outputs=[delivery_result_text, exception_reason, approve_exception_btn],
             api_name=False,
         )
+        export_jianying_btn.click(
+            fn=lambda state: export_editor_handoff(state, "jianying"),
+            inputs=[plan_state],
+            outputs=[editor_export_status, editor_export_file],
+            api_name=False,
+        )
+        export_otio_btn.click(
+            fn=lambda state: export_editor_handoff(state, "otio"),
+            inputs=[plan_state],
+            outputs=[editor_export_status, editor_export_file],
+            api_name=False,
+        )
 
     return demo
 
@@ -2611,7 +3089,7 @@ if __name__ == "__main__":
 
     demo = create_ui()
     demo.launch(
-        server_name="127.0.0.1",
+        server_name=GRADIO_SERVER_NAME,
         server_port=GRADIO_SERVER_PORT,
         share=False,  # 改成 True 可以生成公网链接
         show_error=True,

@@ -43,6 +43,13 @@ SUBTITLE_FONT_COLOR = "white"
 # 留空时让 Gradio 自动在 7860–7959 中寻找可用端口；需要固定端口再在 .env 中设置。
 _gradio_port = os.getenv("GRADIO_SERVER_PORT", "").strip()
 GRADIO_SERVER_PORT = int(_gradio_port) if _gradio_port else None
+GRADIO_SERVER_NAME = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+MOBILE_REVIEW_PORT = int(os.getenv("MOBILE_REVIEW_PORT", "7961"))
+MOBILE_REVIEW_BASE_URL = os.getenv(
+    "MOBILE_REVIEW_BASE_URL", f"http://127.0.0.1:{MOBILE_REVIEW_PORT}"
+)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+REDIS_URL = os.getenv("REDIS_URL", "")
 # Gradio 自身会再次读取这个环境变量；空字符串会被它直接传给 int()。
 # 配置留空表示自动选端口，因此同时清除空值，避免启动时报 ValueError。
 if not _gradio_port:

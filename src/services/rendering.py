@@ -9,7 +9,12 @@ from src.models.schemas import EditScript, ExecutionResult
 
 
 class RenderBackend(Protocol):
-    def render(self, script: EditScript, video_path: str, output_path: str) -> ExecutionResult:
+    def render(
+        self,
+        script: EditScript,
+        video_path: str | dict[str, str],
+        output_path: str,
+    ) -> ExecutionResult:
         ...
 
 
@@ -19,6 +24,10 @@ class FFmpegRenderBackend:
     def __init__(self, executor: ExecutorAgent | None = None):
         self.executor = executor or ExecutorAgent()
 
-    def render(self, script: EditScript, video_path: str, output_path: str) -> ExecutionResult:
+    def render(
+        self,
+        script: EditScript,
+        video_path: str | dict[str, str],
+        output_path: str,
+    ) -> ExecutionResult:
         return self.executor.run(script, video_path, output_path)
-

@@ -205,15 +205,36 @@ def run_ui():
     try:
         from src.ui.app import create_ui
         demo = create_ui()
-        from src.config import GRADIO_SERVER_PORT
-        demo.launch(server_name="127.0.0.1", server_port=GRADIO_SERVER_PORT, share=False)
+        from src.config import GRADIO_SERVER_NAME, GRADIO_SERVER_PORT
+        demo.launch(
+            server_name=GRADIO_SERVER_NAME,
+            server_port=GRADIO_SERVER_PORT,
+            share=False,
+        )
     except ImportError as error:
         print(f"缺少 UI 依赖: {error}")
         print("请先执行: .venv/bin/pip install -r requirements.txt")
 
 
+def run_mobile_review():
+    """启动手机轻量审核服务；局域网使用时把 base URL 配成电脑 IP。"""
+    import uvicorn
+
+    from src.config import MOBILE_REVIEW_PORT
+
+    print(f"启动移动审核页: http://0.0.0.0:{MOBILE_REVIEW_PORT}")
+    uvicorn.run(
+        "src.mobile_review_api:app",
+        host="0.0.0.0",
+        port=MOBILE_REVIEW_PORT,
+        reload=False,
+    )
+
+
 if __name__ == "__main__":
-    if "--ui" in sys.argv:
+    if "--mobile-review" in sys.argv:
+        run_mobile_review()
+    elif "--ui" in sys.argv:
         run_ui()
     else:
         run_cli()

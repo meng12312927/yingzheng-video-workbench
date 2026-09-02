@@ -46,7 +46,12 @@ class EvidenceBuilder:
                 segment for segment in transcript
                 if segment.text.strip() and segment.end > segment.start >= 0
             ),
-            key=lambda segment: (segment.start, segment.end, segment.id),
+            key=lambda segment: (
+                segment.source_asset_id or "",
+                segment.start,
+                segment.end,
+                segment.id,
+            ),
         )
         windows: list[list[TranscriptSegment]] = []
         current: list[TranscriptSegment] = []
@@ -58,7 +63,10 @@ class EvidenceBuilder:
             window_end = max(item.end for item in current)
             joined_length = len(" ".join([*(item.text.strip() for item in current), segment.text.strip()]))
             same_speaker = segment.speaker_id == current[-1].speaker_id
+            same_source = segment.source_asset_id == current[-1].source_asset_id
             can_merge = (
+                same_source
+                and
                 segment.start - window_end <= max_gap_seconds
                 and max(window_end, segment.end) - window_start <= max_window_seconds
                 and joined_length <= max_characters
@@ -77,12 +85,16 @@ class EvidenceBuilder:
             content = " ".join(segment.text.strip() for segment in window)
             source_start = window[0].start
             source_end = max(segment.end for segment in window)
-            fingerprint = f"{source_start:.3f}|{source_end:.3f}|{content}".encode("utf-8")
+            source_asset_id = window[0].source_asset_id
+            fingerprint = (
+                f"{source_asset_id or 'legacy'}|{source_start:.3f}|{source_end:.3f}|{content}"
+            ).encode("utf-8")
             digest = hashlib.sha256(fingerprint).hexdigest()
             speaker_ids = {segment.speaker_id for segment in window}
             evidence.append(
                 Evidence(
                     id=f"evidence_{digest[:16]}",
+                    source_asset_id=source_asset_id,
                     source_start=source_start,
                     source_end=source_end,
                     content=content,
@@ -92,6 +104,7 @@ class EvidenceBuilder:
                         "speaker_id": next(iter(speaker_ids)) if len(speaker_ids) == 1 else None,
                         "segment_count": len(window),
                         "window_strategy": "adjacent_asr_v1",
+                        "source_asset_id": source_asset_id,
                     },
                 )
             )
@@ -212,8 +225,16 @@ class HybridEvidenceRetriever:
         rrf_k: int = 60,
     ):
         self.bm25 = BM25EvidenceRetriever()
+        self.embedding_fn = embedding_fn
         self.dense = DenseEvidenceRetriever(embedding_fn) if embedding_fn else None
         self.rrf_k = rrf_k
+        self.degradation_reason: Optional[str] = None
+
+    def begin_run(self) -> None:
+        """新任务重新尝试向量通道；同一任务失败后仍只走一次降级。"""
+        self.degradation_reason = None
+        if self.embedding_fn is not None and self.dense is None:
+            self.dense = DenseEvidenceRetriever(self.embedding_fn)
 
     def search(self, query: str, evidence: Iterable[Evidence], top_k: int = 8) -> list[tuple[Evidence, float]]:
         items = list(evidence)
@@ -222,10 +243,13 @@ class HybridEvidenceRetriever:
         if self.dense:
             try:
                 rankings.append(self.dense.search(query, items, limit))
-            except Exception:
+            except Exception as error:
                 # 当前进程内首次失败后停用向量通道，避免每个需求都重复请求
                 # 一个已确认不可用的服务；BM25 仍可继续完成证据召回。
                 self.dense = None
+                self.degradation_reason = (
+                    f"dense_retrieval_disabled:{type(error).__name__}:{str(error)[:200]}"
+                )
         non_empty = [ranking for ranking in rankings if ranking]
         if not non_empty:
             return []
@@ -260,7 +284,7 @@ class EvidenceValidator:
         candidate: CandidateClip,
         requirements: Iterable[RequirementItem],
         evidence: Iterable[Evidence],
-        video_duration: float,
+        video_duration: float | dict[str, float],
         allowed_evidence_ids: Optional[Iterable[str]] = None,
     ) -> EvidenceValidationResult:
         requirement_ids = {item.id for item in requirements}
@@ -268,7 +292,16 @@ class EvidenceValidator:
         allowed_ids = set(allowed_evidence_ids) if allowed_evidence_ids is not None else None
         errors: list[str] = []
 
-        if candidate.source_end > video_duration:
+        if isinstance(video_duration, dict):
+            candidate_duration = video_duration.get(candidate.source_asset_id or "")
+            if candidate.source_asset_id is None and len(video_duration) == 1:
+                candidate_duration = next(iter(video_duration.values()))
+            if candidate.source_asset_id and candidate_duration is None:
+                errors.append(f"unknown_source_asset:{candidate.source_asset_id}")
+            candidate_duration = candidate_duration or 0.0
+        else:
+            candidate_duration = video_duration
+        if candidate.source_end > candidate_duration:
             errors.append("candidate_outside_media")
         if not candidate.citations:
             errors.append("missing_citation")
@@ -288,6 +321,11 @@ class EvidenceValidator:
             if item is None:
                 errors.append(f"unknown_evidence:{citation.evidence_id}")
                 continue
+            if (
+                candidate.source_asset_id is not None
+                and item.source_asset_id != candidate.source_asset_id
+            ):
+                errors.append(f"evidence_from_other_source:{citation.evidence_id}")
             if _normalise(citation.quote) not in _normalise(item.content):
                 errors.append(f"quote_not_in_evidence:{citation.evidence_id}")
             if not (candidate.source_start <= item.source_start and item.source_end <= candidate.source_end):

@@ -173,6 +173,9 @@ def test_evaluation_dataset_and_report_cover_mvp2_metrics(tmp_path: Path):
     assert 0 <= report["raw_citation_validity_rate"] <= 1
     assert 0 <= report["hallucination_rate"] <= 1
     assert 0 <= report["human_modification_rate"] <= 1
+    assert report["editing_quality"]["measured_task_count"] == 6
+    assert report["editing_quality"]["complete_expression_rate"] == 1.0
+    assert report["editing_quality"]["source_trace_accuracy"] == 1.0
 
 
 def test_model_observability_records_metadata_without_prompts(tmp_path: Path, monkeypatch):

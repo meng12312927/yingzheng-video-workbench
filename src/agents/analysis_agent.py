@@ -22,6 +22,8 @@ Python 知识点：
 ===========================================================================
 """
 
+from __future__ import annotations
+
 from src.agents.base import BaseAgent
 from src.tools.llm import call_llm
 from src.tools.whisper import WhisperTool
@@ -59,16 +61,22 @@ class AnalysisAgent(BaseAgent):
         self,
         video_path: str,
         requirement: VideoRequirement,
+        source_asset_id: str | None = None,
     ) -> ContentAnalysis:
         """兼容分析接口：只转录与构建证据，不再自由生成高光候选。
 
         候选必须由 ``CandidateAgent`` 经受限检索和引文校验生成；该方法保留
         是为了让已有调用方仍可获得转录和摘要。
         """
-        transcript, evidence, video_duration = self.transcribe(video_path)
+        transcript, evidence, video_duration = self.transcribe(
+            video_path, source_asset_id=source_asset_id
+        )
         summary = self._generate_summary(transcript, video_duration, requirement)
         return ContentAnalysis(
             video_duration=video_duration,
+            source_durations=(
+                {source_asset_id: video_duration} if source_asset_id else {}
+            ),
             transcript=transcript,
             evidence=evidence,
             highlights=[],
@@ -76,12 +84,19 @@ class AnalysisAgent(BaseAgent):
             keyword_timeline=self._build_keyword_timeline(transcript, requirement),
         )
 
-    def transcribe(self, video_path: str) -> tuple[list[TranscriptSegment], list, float]:
+    def transcribe(
+        self,
+        video_path: str,
+        source_asset_id: str | None = None,
+    ) -> tuple[list[TranscriptSegment], list, float]:
         """产生带稳定证据的转录，不在此阶段作内容价值判断。"""
         self.log(f"开始转录视频: {video_path}")
         self._start_timer()
         raw_segments = self.whisper.transcribe(video_path)
-        transcript = [TranscriptSegment(**segment) for segment in raw_segments]
+        transcript = [
+            TranscriptSegment(**segment, source_asset_id=source_asset_id)
+            for segment in raw_segments
+        ]
         evidence = EvidenceBuilder.from_transcript(transcript)
         media_info = FFmpegTool.get_video_info(video_path)
         video_duration = float(media_info["duration"]) if media_info else (transcript[-1].end if transcript else 0.0)

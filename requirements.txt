@@ -25,6 +25,13 @@ python-dotenv>=1.0.0
 
 # Web 界面
 gradio>=4.0.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+qrcode[pil]>=7.4.0
+
+# 可选工程化后端；本地 MVP 不配置连接串时不会连接这些服务。
+redis>=5.0.0
+psycopg[binary]>=3.1.0
 # Gradio 4.x 仍依赖 huggingface_hub.HfFolder；1.x 已移除该接口。
 huggingface-hub<1.0
 

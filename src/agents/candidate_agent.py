@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Iterable, Optional
 from src.agents.base import BaseAgent
 from src.models.schemas import (
     CandidateClip,
+    DurationBudgetPlan,
     Evidence,
     EvidenceCitation,
     ExecutionBrief,
@@ -14,6 +15,7 @@ from src.models.schemas import (
     TranscriptSegment,
 )
 from src.services.evidence import EvidenceValidator, HybridEvidenceRetriever
+from src.services.duration_planner import DurationBudgetPlanner
 from src.tools.llm import call_llm_with_tools, embed_texts
 
 
@@ -66,6 +68,14 @@ class SpeechBoundaryValidator:
         "因为", "所以", "但是", "如果", "当", "从", "为了", "通过", "以及",
         "和", "与", "或者", "就是", "主要是", "包括", "比如", "例如",
     )
+    QUESTION_MARKERS = (
+        "？", "?", "请问", "为什么", "怎么看", "如何", "是否", "能否",
+        "有没有", "什么", "哪些", "怎么样",
+    )
+    ANSWER_PREFIXES = (
+        "我觉得", "我认为", "首先", "因为", "是的", "对", "可以", "目前",
+        "我们", "这个", "其实",
+    )
 
     def validate(
         self,
@@ -75,7 +85,15 @@ class SpeechBoundaryValidator:
         max_continuation_gap: float = 1.5,
     ) -> tuple[str, ...]:
         segments = sorted(
-            (item for item in transcript if item.text.strip() and item.end > item.start),
+            (
+                item for item in transcript
+                if item.text.strip()
+                and item.end > item.start
+                and (
+                    candidate.source_asset_id is None
+                    or item.source_asset_id == candidate.source_asset_id
+                )
+            ),
             key=lambda item: (item.start, item.end),
         )
         if not segments:
@@ -107,6 +125,12 @@ class SpeechBoundaryValidator:
                 or previous.text.strip().endswith(self.DANGLING_SUFFIXES)
             ):
                 errors.append("candidate_starts_mid_sentence")
+            if (
+                first.start - previous.end <= 2.5
+                and self._looks_like_question(previous.text)
+                and first.text.strip().startswith(self.ANSWER_PREFIXES)
+            ):
+                errors.append("candidate_answer_missing_question")
         if last_index + 1 < len(segments):
             following = segments[last_index + 1]
             same_turn = (
@@ -118,7 +142,17 @@ class SpeechBoundaryValidator:
                 or last.text.strip().endswith(self.DANGLING_SUFFIXES)
             ):
                 errors.append("candidate_ends_mid_sentence")
+            if (
+                following.start - last.end <= 2.5
+                and self._looks_like_question(last.text)
+            ):
+                errors.append("candidate_question_missing_answer")
         return tuple(dict.fromkeys(errors))
+
+    @classmethod
+    def _looks_like_question(cls, text: str) -> bool:
+        value = text.strip()
+        return any(marker in value for marker in cls.QUESTION_MARKERS)
 
 
 class CandidateGenerationResult:
@@ -133,6 +167,8 @@ class CandidateGenerationResult:
         degraded: bool = False,
         failure_reason: Optional[str] = None,
         failed_requirement_ids: Optional[list[str]] = None,
+        duration_plan: Optional[DurationBudgetPlan] = None,
+        retrieval_degradation_reason: Optional[str] = None,
     ):
         self.candidates = candidates
         self.valid_ids = valid_ids
@@ -141,6 +177,8 @@ class CandidateGenerationResult:
         self.degraded = degraded
         self.failure_reason = failure_reason
         self.failed_requirement_ids = failed_requirement_ids or []
+        self.duration_plan = duration_plan
+        self.retrieval_degradation_reason = retrieval_degradation_reason
 
     @property
     def valid_candidates(self) -> list[CandidateClip]:
@@ -151,8 +189,8 @@ class CandidateGenerationResult:
 class CandidateAgent(BaseAgent):
     """按单项需求生成小型候选 JSON，再由代码补齐并验证证据字段。"""
 
-    MAX_CANDIDATES = 12
-    MAX_CANDIDATES_PER_REQUIREMENT = 2
+    MAX_CANDIDATES = 18
+    MAX_CANDIDATES_PER_REQUIREMENT = 8
     BATCH_ATTEMPTS = 2
     BATCH_MAX_TOKENS = 1000
 
@@ -162,13 +200,14 @@ class CandidateAgent(BaseAgent):
         self.retriever = retriever or HybridEvidenceRetriever(embedding_fn=embed_texts)
         self.validator = EvidenceValidator()
         self.boundary_validator = SpeechBoundaryValidator()
+        self.duration_planner = DurationBudgetPlanner()
 
     def run(
         self,
         execution_brief: ExecutionBrief,
         requirements: Iterable[RequirementItem],
         evidence: Iterable[Evidence],
-        video_duration: float,
+        video_duration: float | dict[str, float],
         target_duration: Optional[float] = None,
         duration_tolerance: Optional[float] = None,
         transcript: Optional[Iterable[TranscriptSegment]] = None,
@@ -176,6 +215,8 @@ class CandidateAgent(BaseAgent):
         requirements = list(requirements)
         evidence = list(evidence)
         transcript = list(transcript or [])
+        if hasattr(self.retriever, "begin_run"):
+            self.retriever.begin_run()
         selectable_requirements = [
             item for item in requirements
             if item.category == "content" and item.priority != "prohibited"
@@ -189,6 +230,7 @@ class CandidateAgent(BaseAgent):
         def serialise(item: Evidence, score: float) -> dict:
             return {
                 "evidence_id": item.id,
+                "source_asset_id": item.source_asset_id,
                 "source_start": item.source_start,
                 "source_end": item.source_end,
                 "content": item.content,
@@ -199,7 +241,7 @@ class CandidateAgent(BaseAgent):
             "你只处理一项活动视频需求。必须先调用 search_evidence；上下文不足时调用 expand_evidence。"
             "最终仅返回紧凑 JSON：{\"selections\":[{\"evidence_id\":\"...\","
             "\"source_start\":0,\"source_end\":10,\"reason\":\"简短理由\",\"confidence\":0.8}]}。"
-            "最多选择 2 段。不要返回引文、需求 ID、检索分数、字幕全文或其他字段，这些由程序补齐。"
+            "选择数量不得超过请求中的 maximum_selections。不要返回引文、需求 ID、检索分数、字幕全文或其他字段，这些由程序补齐。"
             "只能使用工具返回的 evidence_id 和时间；片段必须覆盖完整的一句话或完整观点，"
             "不能从半句话开始或在人物表达中途结束。没有合格内容就返回空 selections。"
         )
@@ -207,12 +249,31 @@ class CandidateAgent(BaseAgent):
         candidates: list[CandidateClip] = []
         failed_requirement_ids: list[str] = []
         batch_errors: list[str] = []
-        desired_seconds = (
-            max(8.0, min(45.0, float(target_duration) / max(1, len(selectable_requirements))))
-            if target_duration is not None else 20.0
+        available_duration = (
+            sum(video_duration.values())
+            if isinstance(video_duration, dict)
+            else float(video_duration)
         )
+        duration_plan = self.duration_planner.build(
+            selectable_requirements,
+            target_duration=float(target_duration or min(available_duration, 120.0)),
+            duration_tolerance=float(duration_tolerance or 0.0),
+            available_duration=available_duration,
+        )
+        budget_by_requirement = {
+            item.requirement_id: item
+            for item in duration_plan.requirement_budgets
+        }
 
         for requirement in selectable_requirements:
+            requirement_budget = budget_by_requirement.get(requirement.id)
+            desired_seconds = (
+                requirement_budget.target_seconds if requirement_budget else 20.0
+            )
+            maximum_selections = (
+                requirement_budget.desired_candidate_count
+                if requirement_budget else 2
+            )
             retrieval_trace.setdefault(requirement.id, [])
 
             def record_matches(matches) -> None:
@@ -227,7 +288,7 @@ class CandidateAgent(BaseAgent):
                 if requirement_id != requirement.id:
                     return {"error": "unknown_requirement"}
                 matches = self.retriever.search(
-                    query, evidence, top_k=max(1, min(int(top_k), 6))
+                    query, evidence, top_k=max(1, min(int(top_k), 8))
                 )
                 record_matches(matches)
                 return {
@@ -263,17 +324,34 @@ class CandidateAgent(BaseAgent):
                 "prohibited_content": [
                     item.description for item in requirements if item.priority == "prohibited"
                 ],
-                "video_duration": video_duration,
+                "video_duration": (
+                    max(video_duration.values(), default=0.0)
+                    if isinstance(video_duration, dict)
+                    else video_duration
+                ),
+                "source_durations": (
+                    video_duration if isinstance(video_duration, dict)
+                    else {"legacy": video_duration}
+                ),
                 "desired_total_seconds_for_this_requirement": desired_seconds,
-                "maximum_selections": self.MAX_CANDIDATES_PER_REQUIREMENT,
+                "maximum_selections": min(
+                    self.MAX_CANDIDATES_PER_REQUIREMENT, maximum_selections
+                ),
             }
             response: Optional[dict] = None
             last_error: Optional[Exception] = None
             for attempt in range(self.BATCH_ATTEMPTS):
                 try:
+                    attempt_request = {
+                        **request,
+                        "maximum_selections": max(
+                            1,
+                            int(request["maximum_selections"]) // (attempt + 1),
+                        ),
+                    }
                     response = self.llm_runner(
                         system_prompt=system_prompt,
-                        user_message=str(request),
+                        user_message=str(attempt_request),
                         tool_definitions=TOOL_DEFINITIONS,
                         tool_handlers={
                             "search_evidence": search_evidence,
@@ -326,7 +404,7 @@ class CandidateAgent(BaseAgent):
                 raw_selections = response.get("candidates", [])
             if not isinstance(raw_selections, list):
                 raw_selections = []
-            for raw in raw_selections[:self.MAX_CANDIDATES_PER_REQUIREMENT]:
+            for raw in raw_selections[:maximum_selections]:
                 if not isinstance(raw, dict):
                     continue
                 candidate = self._materialise_selection(
@@ -392,6 +470,15 @@ class CandidateAgent(BaseAgent):
                 })
             candidates[index] = updated
         valid_ids = self._limit_valid_candidates(candidates, valid_ids, selectable_requirements)
+        valid_id_set = set(valid_ids)
+        duration_plan = self.duration_planner.complete(
+            duration_plan,
+            (
+                candidate.source_end - candidate.source_start
+                for candidate in candidates
+                if candidate.id in valid_id_set
+            ),
+        )
         self._end_timer()
         self.log(f"生成 {len(candidates)} 个候选，其中 {len(valid_ids)} 个引用校验通过")
         covered_ids = {
@@ -411,12 +498,18 @@ class CandidateAgent(BaseAgent):
             valid_ids,
             retrieval_trace,
             missing_must,
-            degraded=bool(failed_requirement_ids),
+            degraded=bool(failed_requirement_ids) or bool(
+                getattr(self.retriever, "degradation_reason", None)
+            ),
             failure_reason=(
                 "部分候选批次失败：" + ",".join(batch_errors)
-                if batch_errors else None
+                if batch_errors else getattr(self.retriever, "degradation_reason", None)
             ),
             failed_requirement_ids=failed_requirement_ids,
+            duration_plan=duration_plan,
+            retrieval_degradation_reason=getattr(
+                self.retriever, "degradation_reason", None
+            ),
         )
 
     def _materialise_selection(
@@ -427,7 +520,7 @@ class CandidateAgent(BaseAgent):
         retrieval_trace: Dict[str, list[str]],
         retrieval_scores: Dict[tuple[str, str], float],
         transcript: list[TranscriptSegment],
-        video_duration: float,
+        video_duration: float | dict[str, float],
         *,
         fallback: bool,
     ) -> Optional[CandidateClip]:
@@ -462,14 +555,24 @@ class CandidateAgent(BaseAgent):
             proposed_end = float(raw.get("source_end", item.source_end))
         except (TypeError, ValueError):
             proposed_start, proposed_end = item.source_start, item.source_end
+        source_duration = self._source_duration(video_duration, item.source_asset_id)
+        if source_duration <= 0:
+            return None
+        source_transcript = [
+            segment for segment in transcript
+            if (
+                item.source_asset_id is None
+                or segment.source_asset_id == item.source_asset_id
+            )
+        ]
         # 模型不能把一个证据无限扩成整段视频；最多向证据两侧各延伸 20 秒。
         start = max(0.0, max(item.source_start - 20.0, min(proposed_start, item.source_start)))
         end = min(
-            video_duration,
+            source_duration,
             min(item.source_end + 20.0, max(proposed_end, item.source_end)),
         )
         start, end = self._snap_to_transcript_boundaries(
-            start, end, transcript, video_duration
+            start, end, source_transcript, source_duration
         )
         if end <= start:
             return None
@@ -481,6 +584,7 @@ class CandidateAgent(BaseAgent):
         if fallback:
             risk_flags.append("candidate_generation_fallback")
         return CandidateClip(
+            source_asset_id=item.source_asset_id,
             source_start=start,
             source_end=end,
             matched_requirement_ids=[requirement.id],
@@ -519,6 +623,21 @@ class CandidateAgent(BaseAgent):
         if not included:
             return max(0.0, start), min(video_duration, end)
         first_index, last_index = included[0], included[-1]
+        if first_index > 0:
+            first, previous = segments[first_index], segments[first_index - 1]
+            if (
+                first.start - previous.end <= 2.5
+                and SpeechBoundaryValidator._looks_like_question(previous.text)
+                and first.text.strip().startswith(SpeechBoundaryValidator.ANSWER_PREFIXES)
+            ):
+                first_index -= 1
+        if last_index + 1 < len(segments):
+            last, following = segments[last_index], segments[last_index + 1]
+            if (
+                following.start - last.end <= 2.5
+                and SpeechBoundaryValidator._looks_like_question(last.text)
+            ):
+                last_index += 1
         for _ in range(4):
             changed = False
             if first_index > 0:
@@ -553,14 +672,34 @@ class CandidateAgent(BaseAgent):
         )
 
     @staticmethod
+    def _source_duration(
+        video_duration: float | dict[str, float],
+        source_asset_id: Optional[str],
+    ) -> float:
+        if isinstance(video_duration, dict):
+            if source_asset_id is None and len(video_duration) == 1:
+                return float(next(iter(video_duration.values())))
+            return float(video_duration.get(source_asset_id or "", 0.0))
+        return float(video_duration)
+
+    @staticmethod
     def _merge_duplicate_candidates(candidates: list[CandidateClip]) -> list[CandidateClip]:
         """合并不同需求选中的同一素材范围，同时保留每项需求的独立引用。"""
         merged: list[CandidateClip] = []
-        for candidate in sorted(candidates, key=lambda item: (item.source_start, item.source_end)):
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (
+                item.source_asset_id or "",
+                item.source_start,
+                item.source_end,
+            ),
+        ):
             fallback = "candidate_generation_fallback" in candidate.risk_flags
             duplicate = None
             candidate_evidence = {item.evidence_id for item in candidate.citations}
             for existing in merged:
+                if existing.source_asset_id != candidate.source_asset_id:
+                    continue
                 if fallback != ("candidate_generation_fallback" in existing.risk_flags):
                     continue
                 overlap = max(

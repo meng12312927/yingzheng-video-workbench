@@ -12,6 +12,7 @@ from src.agents.candidate_agent import CandidateAgent
 from src.agents.candidate_agent import SpeechBoundaryValidator
 from src.agents.clarification_agent import RequirementClarificationAgent
 from src.agents.alignment_agent import RequirementAlignmentAgent
+from src.agents.material_interview_agent import MaterialInterviewAgent
 from src.agents.requirement_agent import RequirementAgent
 from src.agents.style_agent import StyleRecommendationAgent
 from src.models.schemas import (
@@ -33,9 +34,18 @@ from src.models.schemas import (
     AuditableEditPlan,
     DeliverySpec,
     ExecutionResult,
+    SourceAsset,
+    TaskMaterialSet,
+    TimelineSegment,
 )
+from src.services.editor_adapters import JianyingHandoffAdapter, OTIOAdapter
+from src.services.media_assets import MediaAssetService
+from src.services.mobile_review import MobileReviewService
+from src.services.infrastructure import LocalIdempotencyBackend
+from src.services.organization_profiles import OrganizationProfileService
 from src.services.task_store import TaskStore
 from src.services.requirements import RequirementClarificationService
+from src.services.reference_documents import ReferenceDocumentService
 from src.services.state_machine import (
     IdempotencyConflictError,
     InvalidTransitionError,
@@ -48,11 +58,435 @@ from src.services.evidence import (
     HybridEvidenceRetriever,
     LexicalEvidenceRetriever,
 )
+from src.services.duration_planner import DurationBudgetPlanner
 from src.services.plans import EditPlanService
+from src.services.timeline_ir import TimelineCompiler
 from src.services.verification import VerificationEngine
 from src.orchestrator import VideoEditOrchestrator
 from src.tools.ffmpeg import FFmpegTool
 from src.tools import llm as llm_tools
+
+
+def test_multi_asset_analysis_keeps_source_local_time_and_partial_results(
+    tmp_path: Path, monkeypatch
+):
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    monkeypatch.setattr(
+        "src.services.media_assets.FFmpegTool.get_video_info",
+        lambda path: {
+            "duration": 10.0 if str(path).endswith("first.mp4") else 20.0,
+            "width": 1280,
+            "height": 720,
+            "codec": "h264",
+            "has_audio": True,
+        },
+    )
+
+    class FakeAnalysisAgent:
+        def run(self, path, requirement, source_asset_id=None):
+            if str(path).endswith("second.mp4"):
+                raise RuntimeError("second failed")
+            transcript = [
+                TranscriptSegment(
+                    source_asset_id=source_asset_id,
+                    start=1,
+                    end=3,
+                    text="第一段素材的完整表达",
+                )
+            ]
+            return ContentAnalysis(
+                video_duration=10,
+                source_durations={source_asset_id: 10},
+                transcript=transcript,
+                evidence=EvidenceBuilder.from_transcript(transcript),
+                summary="第一段摘要",
+            )
+
+    service = MediaAssetService()
+    material_set = service.register("task-1", [str(first), str(second)])
+    completed, aggregate = service.analyze(
+        material_set,
+        VideoRequirement(target_duration=30, video_type="general", style="formal"),
+        FakeAnalysisAgent(),
+        TaskStore(tmp_path / "task-1"),
+    )
+
+    assert completed.status == "partial"
+    assert [item.status for item in completed.results] == ["ready", "failed"]
+    assert aggregate.video_duration == 30
+    assert aggregate.transcript[0].start == 1
+    assert aggregate.transcript[0].source_asset_id == completed.sources[0].id
+    assert aggregate.evidence[0].source_asset_id == completed.sources[0].id
+    assert (tmp_path / "task-1" / "sources" / completed.sources[0].id / "analysis.json").exists()
+    assert not (tmp_path / "task-1" / "merged_source.mp4").exists()
+
+    class RetryAgent:
+        def run(self, path, requirement, source_asset_id=None):
+            transcript = [
+                TranscriptSegment(
+                    source_asset_id=source_asset_id,
+                    start=2,
+                    end=5,
+                    text="第二段素材重试成功",
+                )
+            ]
+            return ContentAnalysis(
+                video_duration=20,
+                source_durations={source_asset_id: 20},
+                transcript=transcript,
+                evidence=EvidenceBuilder.from_transcript(transcript),
+            )
+
+    retried, retried_aggregate = service.retry_source(
+        completed,
+        source_asset_id=completed.sources[1].id,
+        requirement=VideoRequirement(
+            target_duration=30, video_type="general", style="formal"
+        ),
+        analysis_agent=RetryAgent(),
+        store=TaskStore(tmp_path / "task-1"),
+        retry_reason="网络恢复后重试",
+    )
+    assert retried.status == "ready"
+    assert retried.results[0].attempt_count == 1
+    assert retried.results[1].attempt_count == 2
+    assert len(retried_aggregate.transcript) == 2
+
+
+def test_same_local_time_from_different_assets_is_not_merged():
+    transcript = [
+        TranscriptSegment(source_asset_id="asset-a", start=0, end=5, text="甲素材"),
+        TranscriptSegment(source_asset_id="asset-b", start=0, end=5, text="乙素材"),
+    ]
+    evidence = EvidenceBuilder.from_transcript(transcript)
+    requirement = RequirementItem(description="保留内容")
+    candidates = [
+        CandidateClip(
+            source_asset_id=item.source_asset_id,
+            source_start=item.source_start,
+            source_end=item.source_end,
+            matched_requirement_ids=[requirement.id],
+            citations=[EvidenceCitation(
+                requirement_id=requirement.id,
+                evidence_id=item.id,
+                quote=item.content,
+            )],
+            selection_reason="相关内容",
+            confidence=0.8,
+            suggested_duration=5,
+        )
+        for item in evidence
+    ]
+
+    assert len(evidence) == 2
+    assert len(CandidateAgent._merge_duplicate_candidates(candidates)) == 2
+
+
+def test_material_interview_agent_only_accepts_retrieved_source_evidence():
+    transcript = [
+        TranscriptSegment(
+            source_asset_id="asset-a",
+            start=10,
+            end=18,
+            text="主持人介绍了活动背景和本次活动目标",
+        )
+    ]
+    evidence = EvidenceBuilder.from_transcript(transcript)
+    analysis = ContentAnalysis(
+        video_duration=30,
+        source_durations={"asset-a": 30},
+        transcript=transcript,
+        evidence=evidence,
+        summary="一段活动介绍",
+    )
+
+    class Retriever:
+        def search(self, query, items, top_k=8):
+            return [(list(items)[0], 0.9)]
+
+    def runner(**kwargs):
+        result = kwargs["tool_handlers"]["search_material_evidence"](
+            "活动介绍", 3
+        )
+        return {
+            "questions": [
+                {
+                    "decision_type": "retain",
+                    "question": "主持人介绍活动背景的这段内容，需要完整保留还是只保留核心目标？",
+                    "reason": "素材中同时包含活动背景和活动目标。",
+                    "impact": "会影响开场信息量和后续内容可用时长。",
+                    "answer_hint": "例如：背景简短带过，完整保留活动目标",
+                    "supporting_evidence_ids": [
+                        result["evidence"][0]["evidence_id"], "invented"
+                    ],
+                }
+            ]
+        }
+
+    agent = MaterialInterviewAgent(llm_runner=runner, retriever=Retriever())
+    questions = agent.run(
+        raw_text="剪一个活动回顾",
+        spec=RequirementSpec(brief_id="brief-1", target_duration=60),
+        analysis=analysis,
+        scenario="school",
+        source_labels={"asset-a": "开场.mp4"},
+    )
+
+    assert len(questions) == 1
+    assert questions[0].supporting_evidence_ids == [evidence[0].id]
+    assert questions[0].source_asset_ids == ["asset-a"]
+
+
+def test_duration_budget_reserves_more_time_for_must_and_reports_shortage():
+    must = RequirementItem(
+        description="完整保留领导致辞",
+        priority="must",
+        acceptance_rule="至少一段完整致辞",
+    )
+    should = RequirementItem(description="保留活动氛围")
+    planner = DurationBudgetPlanner()
+    plan = planner.build(
+        [must, should],
+        target_duration=210,
+        duration_tolerance=15,
+        available_duration=600,
+    )
+    budgets = {item.requirement_id: item for item in plan.requirement_budgets}
+
+    assert budgets[must.id].target_seconds > budgets[should.id].target_seconds
+    assert budgets[must.id].desired_candidate_count > 2
+    completed = planner.complete(plan, [30, 30, 30])
+    assert completed.status == "short"
+    assert completed.shortage_seconds == 105
+    assert any("还差" in item for item in completed.recommendations)
+
+
+def test_speech_boundary_expands_question_and_answer_as_one_unit():
+    transcript = [
+        TranscriptSegment(source_asset_id="asset-a", start=0, end=4, text="请问你怎么看这次活动？"),
+        TranscriptSegment(source_asset_id="asset-a", start=4.2, end=10, text="我觉得活动让大家交流得更深入。"),
+    ]
+    agent = CandidateAgent(llm_runner=lambda **_: {})
+    start, end = agent._snap_to_transcript_boundaries(4.2, 10, transcript, 20)
+
+    assert start == 0
+    assert end == 10
+
+
+def test_approved_plan_compiles_to_jianying_handoff_and_otio(tmp_path: Path):
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"placeholder")
+    source = SourceAsset(
+        id="asset-a",
+        order=1,
+        filename="source.mp4",
+        source_path=str(source_path),
+        content_hash="hash-a",
+        duration=30,
+        fps=25,
+        has_audio=True,
+        analysis_state="ready",
+    )
+    delivery = DeliverySpec(
+        requirement_spec_id="spec-a",
+        requirement_spec_version=1,
+        target_duration=10,
+        duration_tolerance=2,
+    )
+    segment = TimelineSegment(
+        order=1,
+        candidate_id="candidate-a",
+        source_asset_id="asset-a",
+        source_start=5,
+        source_end=15,
+        output_start=0,
+        output_end=10,
+        matched_requirement_ids=["req-a"],
+        evidence_ids=["evidence-a"],
+    )
+    script = EditScript(
+        title="活动回顾",
+        estimated_duration=10,
+        operations=[EditOperation(
+            order=1,
+            source_asset_id="asset-a",
+            action="cut",
+            source_start=5,
+            source_end=15,
+        )],
+    )
+    plan = AuditableEditPlan(
+        requirement_spec_id="spec-a",
+        requirement_spec_version=1,
+        delivery_spec=delivery,
+        timeline_segments=[segment],
+        candidate_ids=["candidate-a"],
+        execution_script=script,
+        estimated_duration=10,
+        status="approved",
+    )
+    material_set = TaskMaterialSet(task_id="task-a", sources=[source])
+    timeline = TimelineCompiler().compile(
+        task_id="task-a", plan=plan, material_set=material_set
+    )
+
+    assert timeline.clips[0].source_asset_id == "asset-a"
+    handoff = JianyingHandoffAdapter(render_clips=False).export(
+        timeline, tmp_path / "jianying"
+    )
+    otio = OTIOAdapter().export(timeline, tmp_path / "otio")
+    assert handoff.success
+    assert (tmp_path / "jianying" / "clip_order.csv").exists()
+    assert (tmp_path / "jianying" / "导入剪映说明.md").exists()
+    assert otio.success
+    assert Path(otio.output_path).suffix == ".otio"
+
+
+def test_reference_document_creates_pending_proper_noun_review(tmp_path: Path):
+    names = tmp_path / "人员名单.csv"
+    names.write_text("姓名,职务\n李浩然,活动负责人\n", encoding="utf-8")
+    service = ReferenceDocumentService()
+    library = service.ingest(
+        task_id="task-a",
+        path=str(names),
+        category="people",
+    )
+    transcript = [
+        TranscriptSegment(
+            source_asset_id="asset-a",
+            start=2,
+            end=6,
+            text="下面请李昊然为大家介绍活动安排",
+        )
+    ]
+    queue = service.build_entity_queue(
+        task_id="task-a",
+        analysis=ContentAnalysis(
+            video_duration=10,
+            source_durations={"asset-a": 10},
+            transcript=transcript,
+        ),
+        library=library,
+    )
+
+    match = next(item for item in queue.items if item.suggested_text == "李浩然")
+    assert match.status == "pending"
+    assert match.observed_text == "李昊然"
+    confirmed = service.resolve(
+        queue,
+        item_id=match.id,
+        action="confirm",
+        actor_id="reviewer",
+    )
+    resolved = next(item for item in confirmed.items if item.id == match.id)
+    assert resolved.status == "confirmed"
+    assert resolved.confirmed_value == "李浩然"
+
+
+def test_mobile_review_token_is_version_bound_and_submission_is_idempotent(tmp_path: Path):
+    store = TaskStore(tmp_path / "tasks" / "task-mobile")
+    delivery = DeliverySpec(
+        requirement_spec_id="spec-mobile",
+        requirement_spec_version=1,
+        target_duration=10,
+        duration_tolerance=2,
+    )
+    plan = AuditableEditPlan(
+        requirement_spec_id="spec-mobile",
+        requirement_spec_version=1,
+        delivery_spec=delivery,
+        execution_script=EditScript(title="审核", estimated_duration=0),
+        estimated_duration=0,
+    )
+    store.save_plan_draft(plan)
+    service = MobileReviewService()
+    link = service.issue(
+        store=store,
+        plan=plan,
+        base_url="http://127.0.0.1:7961",
+        ttl_hours=1,
+    )
+    token = link.url.rsplit("/", 1)[-1]
+    assert link.url.startswith("http://127.0.0.1:7961/review/")
+
+    submission = service.submit(
+        tasks_root=tmp_path / "tasks",
+        token=token,
+        decision="changes_requested",
+        comment="请增加颁奖画面",
+        reviewer_name="李主任",
+        idempotency_key="same-submit",
+    )
+    duplicate = service.submit(
+        tasks_root=tmp_path / "tasks",
+        token=token,
+        decision="changes_requested",
+        comment="请增加颁奖画面",
+        reviewer_name="李主任",
+        idempotency_key="same-submit",
+    )
+
+    assert submission.id == duplicate.id
+    with pytest.raises(ValueError, match="失效"):
+        service.inspect(tmp_path / "tasks", token)
+    revoked_link = service.issue(
+        store=store,
+        plan=plan,
+        base_url="http://127.0.0.1:7961",
+        ttl_hours=1,
+    )
+    service.revoke(store, revoked_link.token_record_id)
+    with pytest.raises(ValueError, match="失效"):
+        service.inspect(
+            tmp_path / "tasks",
+            revoked_link.url.rsplit("/", 1)[-1],
+        )
+
+
+def test_organization_profile_is_versioned_and_deleted_rules_leave_context(tmp_path: Path):
+    service = OrganizationProfileService(tmp_path / "organizations")
+    profile = service.create(
+        name="示例学校",
+        scenario="school",
+        created_by="admin",
+    )
+    revised = service.add_item(
+        profile.id,
+        kind="proper_noun",
+        label="校长姓名",
+        value="李浩然",
+        aliases=["李昊然"],
+        source="学校办公室确认",
+    )
+    restricted = service.add_item(
+        profile.id,
+        kind="publishing_restriction",
+        label="未成年人信息",
+        value="不得展示未获授权学生的全名",
+        source="学校发布规范 v2",
+    )
+
+    context = service.active_context(profile.id)
+    assert context["proper_nouns"][0]["value"] == "李浩然"
+    assert context["publishing_restrictions"][0]["source"] == "学校发布规范 v2"
+    assert service.load(profile.id, version=revised.version).version == 2
+
+    deleted = service.delete_item(profile.id, restricted.items[-1].id)
+    assert deleted.version == 4
+    assert service.active_context(profile.id)["publishing_restrictions"] == []
+
+
+def test_local_idempotency_backend_persists_render_lock(tmp_path: Path):
+    first = LocalIdempotencyBackend(tmp_path / "locks.json")
+    second = LocalIdempotencyBackend(tmp_path / "locks.json")
+
+    assert first.acquire("render:task:1", 60)
+    assert not second.acquire("render:task:1", 60)
+    first.release("render:task:1")
+    assert second.acquire("render:task:1", 60)
 
 
 def test_requirement_compiler_creates_visible_execution_instruction(monkeypatch):

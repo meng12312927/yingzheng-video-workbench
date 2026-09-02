@@ -1,13 +1,13 @@
-# 技术方案：活动视频 AI 需求、审核与验收工作台
+# 技术方案：可审核的 AI Editing Harness 与编辑器适配
 
-> 版本：v3.4
-> 状态：MVP2 已按本方案实现，现有 FFmpeg 粗剪流水线作为可替换执行后端
-> 更新日期：2026-07-16
+> 版本：v4.0
+> 状态：分素材 Editing Harness 核心链路已实现，进入质量与适配器迭代
+> 更新日期：2026-09-02
 > 对齐文档：[PRD](PRD.md)
 
 ## 1. 技术目标
 
-系统从固定的“LLM 分析后直接粗剪”流水线演进为面向活动视频的领域 Harness。它负责管理模型上下文、结构化需求、证据、决策、人工批准、执行状态和成片验收；FFmpeg 是当前默认执行器，不承担产品核心语义。
+系统从固定的“LLM 分析后直接粗剪”流水线演进为面向活动视频的 Editing Harness。它负责按原文件理解一段或多段素材、管理模型上下文、证据化访谈、结构化需求、剪辑决策、人工批准、通用时间线、编辑器交付和验收；FFmpeg 是预览与基础交付执行器，不承担产品核心语义。
 
 技术目标：
 
@@ -15,13 +15,13 @@
 - 要求模型结论引用业务证据，避免只返回不可审计的自由文本。
 - 将 AI 建议与用户批准分离，未经批准的计划不能正式渲染。
 - 保存用户可理解的业务审计记录和独立的技术日志。
-- 支持电脑处理长素材、电脑端完成需求与方案审核；移动审批延后到 MVP 验证后。
+- 支持电脑处理长素材和完整审核，并直接建设可撤销、可过期、幂等的手机轻量审核能力。
 - 将验收规则前置到需求阶段，并在成片后逐项验证。
 - 保留现有本地优先和确定性 FFmpeg 能力。
 - 用有限多轮槽位补全代替一次性猜测需求，并用正式状态机管理推进、回退、恢复和幂等。
 - 在保持视频为主素材的前提下，为转录、用户标注和后续 OCR/场景/音频证据建立统一的检索、重排与引用协议。
 - 区分任务记忆、组织记忆和偏好建议；只有已确认事实才能跨阶段或跨任务复用。
-- 通过可替换的模型、检索、存储和渲染边界支持本地单机 MVP 向组织化部署演进，但不提前引入未经验证的分布式复杂度。
+- 通过可替换的模型、检索、存储、预览渲染和编辑器 Adapter 支持本地单机向组织化部署演进；PostgreSQL/Redis/Docker Compose 进入可选实现，但本地模式继续存在。
 
 ## 2. 设计原则
 
@@ -61,36 +61,38 @@ LLM 用于：
 
 确定性系统检查（媒体预检、时间范围、时长计算、文件校验）不能被用户强制通过；其输入、结果和错误信息应可见并写入审计记录。
 
-### 2.4 执行器可替换但当前不泛化过度
+### 2.4 通用时间线与可替换执行器
 
-MVP 继续使用 FFmpeg。技术上保留 `RenderBackend` 边界，但暂不实现 MCP、AE、Premiere 或 Resolve 适配器，避免为未验证需求增加复杂度。
+`CanonicalTimeline` 是编辑决定的事实来源。`PreviewRenderer` 负责生成审核预览，首个实现继续使用 FFmpeg；`EditorAdapter` 负责验证并导出剪映交接包、OTIO 或后续专业剪辑软件格式。模型不得直接写剪映私有草稿或触发有副作用的软件自动化。
 
-### 2.5 复杂能力必须由指标驱动
+### 2.5 复杂能力必须可测、可关和可降级
 
-Rerank、多模态模型、组织级数据库、服务化向量索引、本地大模型和模型微调都必须回答一个已测量的问题，例如 `must` 召回不足、专有名词返工高、无声关键画面漏检、任务无法恢复或敏感转录不能出本机。新能力必须与既有基线做同集对比并提供关闭和降级路径；不能仅因框架流行而替换已验证链路。
+Rerank、多模态模型、组织级数据库、服务化向量索引、本地大模型和模型微调均进入可实施路线，但每项必须提供独立开关、基线对比、错误隔离和本地降级路径。真实用户指标不再作为启动门槛，仍用于排序、参数选择、默认启用和删减；不能仅因框架流行而替换已验证链路。
 
 ## 3. 目标架构
 
 ```text
-电脑 Web UI / CLI
+电脑 Web UI / 手机轻审核 / CLI
         │
         ▼
 VideoProductionHarness
                        │
-      ┌────────────────┼─────────────────┐
-      ▼                ▼                 ▼
-RequirementCompiler EvidenceRetriever CandidateAnalyzer ApprovalService
-      │                │                 │
+      ┌────────────────┼────────────────────────┐
+      ▼                ▼                        ▼
+SourceAnalyzer   EditingInterviewAgent   ApprovalService
+      │                │                        │
       └────────────────┼─────────────────┘
                        ▼
-              AuditableEditPlanner
+            EvidenceRetriever / CandidatePlanner
                        │
-                 Approval Gate
+             DurationPlanner / BoundaryGuard
                        │
                        ▼
-                  RenderRouter
+              CanonicalTimeline + Gate
                        │
-                 FFmpegBackend
+          ┌────────────┼──────────────┐
+          ▼            ▼              ▼
+ FFmpegPreview   HandoffPackage     OTIO Adapter
                        │
                        ▼
               VerificationEngine
@@ -109,13 +111,13 @@ RequirementCompiler EvidenceRetriever CandidateAnalyzer ApprovalService
 - 在执行前后建立可追溯记录。
 - 识别失败原因并决定失败、降级或等待人工处理。
 
-Harness 不是自由对话式多 Agent 系统。各组件通过明确的数据契约协作，Orchestrator 仍是唯一流程控制者。`RequirementAlignmentAgent` 只比较素材事实与任务书并产生建议，是否写入任务书始终由用户决定。
+Harness 不是自由对话式多 Agent 系统。各组件通过明确的数据契约协作，Orchestrator 仍是唯一流程控制者。每段素材独立分析，`EditingInterviewAgent` 只能基于素材大纲和受限检索工具提问；是否写入任务书始终由用户决定。
 
 ### 3.2 分阶段部署形态
 
-MVP 2 保持单进程、本地任务目录和本地媒体处理，先完成业务闭环。接口边界按未来部署设计，但不要求当前拆服务。
+本地模式继续保持单进程、本地任务目录和本地媒体处理，作为开发、隐私和降级基线。接口边界同步实现可选服务化，但不强制本地用户安装数据库。
 
-V1.1 在真实任务验证通过后，可将任务、事件、审核和短期会话迁移到 PostgreSQL/Redis，并保留原始媒体和高码率素材在本机或受控对象存储。V1.2 只有出现多组织、多审核角色、并发任务或私有化交付需求时，才演进为以下形态：
+V1.1 直接提取 `TaskRepository/EventRepository/ArtifactStore` 协议，并提供 PostgreSQL 可选实现；Redis 只保存短期会话、幂等键、锁和缓存。原始媒体和高码率素材保留在本机或受控对象存储。多组织、多审核角色、并发任务或私有化交付可演进为以下形态：
 
 ```text
 Web UI
@@ -362,6 +364,7 @@ class DeliverySpec(BaseModel):
 ```python
 class Evidence(BaseModel):
     id: str
+    source_asset_id: str | None
     type: Literal[
         "transcript", "user_annotation", "event_document",
         "ocr", "scene", "audio", "keyframe"
@@ -376,7 +379,7 @@ class Evidence(BaseModel):
     metadata: dict = {}
 ```
 
-MVP 2 只要求 `transcript` 和 `user_annotation`；其他类型预留但不承诺实现。转录证据由 ASR 片段按时间窗口合并生成，保留 `segment_ids`、源时间、原文和内容哈希，成为不可被模型改写的引用源。活动辅助资料使用 `source_uri` 和页码/行号等 `source_locator`；视觉和音频证据必须保留源时间与可预览资产。不同类型证据统一使用确认状态，模型置信度不能代替人工确认。
+当前实现包含 `transcript`、`user_annotation` 和独立的 `ReferenceDocumentEvidence`。转录证据保留 `source_asset_id`、`segment_ids`、来源本地时间、原文和内容哈希；活动资料证据保留文件版本与行号、单元格或 JSON 路径。OCR、场景、音频和关键帧证据仍是后续多模态路线。任何来源的模型置信度都不能代替高风险文字的人工确认。
 
 ### 4.4 CandidateClip 与 Decision
 
@@ -701,9 +704,9 @@ MVP2 暴露给模型的工具只有 `search_evidence` 和 `expand_evidence`；`g
 - 用户选择、字幕修正和计划汇总。
 - 渲染与验收报告。
 
-### 8.2 移动端（V1.1 以后）
+### 8.2 手机轻量审核（V1.1 直接实施）
 
-二维码、局域网 token、过期、撤销和重复提交保护属于 V1.1，不进入 MVP。MVP 只要确保领域事件与 UI 无关、任务可从本地持久化产物恢复，为未来增加移动端留出接口。
+手机端只提供任务书、候选预览、风险、意见和批准，不实现手机时间线编辑器。审核链接使用短期 Token、最小任务范围、过期、撤销和重复提交幂等保护；低码率代理可供审核，原始素材默认留在本地或受控存储。领域事件继续与 UI 无关，电脑端和手机端复用同一 Gate 与审计接口。
 
 ### 8.3 隐私边界
 
@@ -717,22 +720,21 @@ MVP2 暴露给模型的工具只有 `search_evidence` 和 `expand_evidence`；`g
 ### 9.1 接口
 
 ```python
-class RenderBackend(Protocol):
-    def render(
-        self,
-        script: EditScript,
-        video_path: str,
-        output_path: str,
-    ) -> ExecutionResult: ...
+class PreviewRenderer(Protocol):
+    def render_preview(self, timeline: CanonicalTimeline, output_path: str) -> ExecutionResult: ...
+
+class EditorAdapter(Protocol):
+    def validate(self, timeline: CanonicalTimeline) -> list[VerificationResult]: ...
+    def export(self, timeline: CanonicalTimeline, output_dir: str) -> EditorExportResult: ...
 ```
 
-MVP 只实现 `FFmpegRenderBackend`，内部可以复用当前 `ExecutorAgent` 和 `FFmpegTool`，先完成接口提取，不改变已验证行为。
+迁移期保留 `FFmpegRenderBackend` 兼容层，并实现 `FFmpegPreviewRenderer`、`HandoffPackageAdapter` 和可选 `OTIOAdapter`。内部复用当前 `ExecutorAgent` 与 `FFmpegTool`，不改变已验证的基础渲染行为。
 
 ### 9.2 当前 FFmpeg 行为
 
-- 输入支持一段或多段视频。多段素材先按上传顺序进行缩放补边、统一帧率与音频采样率，再合成为 `merged_source.mp4`；无音轨的个别片段补静音轨，但全部素材均无音频时仍拒绝进入语音分析。
-- `source_media.json` 保存原文件顺序、各段时长、合并时间线偏移和合并文件路径，后续候选、人工补片和渲染统一使用合并时间轴。
-- 输入预检要求所有文件具有可解码视频流，并且至少一段素材具有可用音频流。
+- 输入支持一段或多段视频。每段素材生成独立 `SourceAsset`，分别预检、转录、摘要和索引；分析前不统一规格、不拼接长视频。没有音轨的单段素材保存 `no_audio` 状态且不阻断其他素材。
+- `material_set.json` 保存原文件、媒体信息和各自分析状态；转录、证据、候选和人工补片统一使用 `source_asset_id + source-local time`。
+- 预览或交付时，FFmpeg 根据 `CanonicalTimeline` 从不同原素材取段，按批准顺序统一规格并组合。至少一段有音频即可进入语音流程；无语音素材仍保留给用户标注和后续视觉证据。
 - 每个片段重新编码，避免关键帧切割偏移。
 - 支持拼接、淡转场、BGM、基础片头片尾和字幕烧录。
 - macOS 优先 `h264_videotoolbox`，失败时回退 `libx264`。
@@ -740,7 +742,7 @@ MVP 只实现 `FFmpegRenderBackend`，内部可以复用当前 `ExecutorAgent` �
 
 ### 9.3 外部剪辑软件
 
-MCP、AE、Premiere、Resolve 和 FastCut 不进入当前实施范围。未来只有在真实用户需要可编辑工程或高级包装时，才基于批准后的 `AuditableEditPlan` 增加 Adapter；外部软件不得成为需求、证据和批准的事实来源。
+v4.0 直接实现通用 `EditorAdapter`、剪映稳定交接包和 OTIO 导出。Premiere、Resolve、Final Cut 等后续通过 OTIO/FCP XML/EDL 适配；剪映私有草稿和 UI 自动化只能作为关闭默认值、版本绑定的实验能力。外部软件不得成为需求、证据和批准的事实来源。
 
 ## 10. 验收引擎
 
@@ -778,9 +780,15 @@ MCP、AE、Premiere、Resolve 和 FastCut 不进入当前实施范围。未来�
 ```text
 output/tasks/<task_id>/
 ├── manifest.json
-├── media_info.json
-├── source_media.json
-├── merged_source.mp4             # 仅多素材任务生成
+├── material_set.json             # 全部 SourceAsset 与聚合状态
+├── sources/
+│   ├── asset_001/
+│   │   ├── source_manifest.json
+│   │   ├── transcript.json
+│   │   ├── evidence.json
+│   │   └── material_summary.json
+│   └── asset_002/
+├── material_profile.json
 ├── requirement_brief.json
 ├── clarification_turns.jsonl
 ├── requirement_slots_v1.json
@@ -791,8 +799,6 @@ output/tasks/<task_id>/
 ├── legacy_requirement_v1.json
 ├── delivery_spec_v1.json
 ├── style_proposals_v1.json
-├── transcript.json
-├── evidence.json
 ├── retrieval_trace.json
 ├── candidate_generation.json
 ├── candidate_clips.json
@@ -949,7 +955,7 @@ MVP 提供可重复的本地安装和环境检查；每条模型调用记录独�
 ### 阶段三：批准与验收
 
 - 新增计划版本、批准门禁和批准失效规则。
-- 保存预检、风格、证据、候选、渲染和交付的版本化系统产物；人工 Gate 只用于条件需求确认与合并方案批准。
+- 保存预检、风格、证据、候选、渲染和交付的版本化系统产物；人工 Gate 只用于条件需求确认与剪辑方案批准。
 - 抽取 `FFmpegRenderBackend`。
 - 实现 `VerificationEngine` 和 `DeliveryReport`。
 
@@ -961,20 +967,23 @@ MVP 提供可重复的本地安装和环境检查；每条模型调用记录独�
 - 对比“无需求编译/无证据检索”与完整链路，记录消融结果。
 - 固化 Prompt、模型、工具调用、检索和校验的版本化日志。
 
-### 阶段五：真实用户验证与 V1.1 决策
+### 阶段五：真实用户验证与优先级校准
 
 - 学校和企业各完成 3–5 个任务。
-- 根据必须项召回、审核时间和返工数据调整需求包。
-- 未达到 PRD 指标前不开发移动审核、完整剪辑器、MCP 或 AE Agent。
+- 根据必须项召回、审核时间、人工补片和返工数据调整默认开关、参数和实施顺序。
+- 指标不阻塞已经批准的 V1.1 工程路线，但未经验证不得宣称节省时间或减少返工。
 
-### 阶段六：V1.1 降低返工（通过阶段五门槛后）
+### 阶段六：V1.1 Editing Harness 与降低返工（核心能力已实现，持续优化）
 
+- 实现多素材独立分析、素材大纲、受限上下文工具和证据化剪辑访谈。
+- 实现完整表达边界、问答上下文保护、确定性时长规划和候选多样性。
+- 实现 `CanonicalTimeline`、FFmpeg 预览、剪映交接包和 OTIO Adapter。
 - 抽象并迁移 PostgreSQL `TaskRepository/EventRepository`，Redis 仅承担缓存、幂等和锁。
 - 支持任务恢复、局部重新分析、人物/职务/奖项确认和小规模活动辅助资料。
 - 建立组织品牌、专有名词和发布限制的可管理记忆；所有记忆有来源、版本和删除入口。
-- 增加 Docker Compose、健康检查、结构化日志和审核链接安全机制。
+- 增加手机轻审核、Docker Compose、健康检查、结构化日志和审核链接安全机制。
 
-### 阶段七：V1.2 组织化与多模态（V1.1 有持续使用证据后）
+### 阶段七：V1.2 组织化与多模态
 
 - 按漏检和返工数据依次验证 OCR、场景、音频事件、关键帧描述，不一次性接入所有模型。
 - 若本地 FAISS 无法满足规模/过滤/并发指标，再比较 Elasticsearch/Milvus 等服务化索引。

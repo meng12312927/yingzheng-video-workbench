@@ -1,8 +1,11 @@
 """Agent 3：将候选高光片段转换为可执行、可审核的剪辑计划。"""
 
+from __future__ import annotations
+
 from src.agents.base import BaseAgent
 from src.tools.llm import call_llm
-from typing import Optional
+import re
+from typing import Iterable, Optional
 from src.models.schemas import (
     ContentAnalysis,
     EditOperation,
@@ -18,7 +21,7 @@ class ScriptAgent(BaseAgent):
     """用确定性规则生成剪辑计划，避免 LLM 改写合法的时间边界。"""
 
     MIN_CLIP_DURATION = 3.0
-    MAX_CLIP_DURATION = 30.0
+    MAX_CLIP_DURATION = 60.0
 
     def __init__(self):
         super().__init__("ScriptAgent")
@@ -38,13 +41,14 @@ class ScriptAgent(BaseAgent):
         selected = self._select_clips(
             analysis.highlights,
             requirement.target_duration,
-            analysis.video_duration,
+            analysis.source_durations or analysis.video_duration,
             must_requirement_ids=must_ids,
             duration_tolerance=duration_tolerance,
         )
         operations = [
             EditOperation(
                 order=index,
+                source_asset_id=clip.source_asset_id,
                 action="cut",
                 source_start=clip.start,
                 source_end=clip.end,
@@ -72,7 +76,7 @@ class ScriptAgent(BaseAgent):
         self,
         highlights: list[HighlightClip],
         target_duration: float,
-        video_duration: float,
+        video_duration: float | dict[str, float],
         must_requirement_ids: Optional[set[str]] = None,
         duration_tolerance: Optional[float] = None,
     ) -> list[HighlightClip]:
@@ -85,8 +89,16 @@ class ScriptAgent(BaseAgent):
         must_ids = set(must_requirement_ids or set())
 
         def normalise_clip(clip: HighlightClip) -> Optional[HighlightClip]:
+            if isinstance(video_duration, dict):
+                duration = video_duration.get(clip.source_asset_id or "")
+                if clip.source_asset_id is None and len(video_duration) == 1:
+                    duration = next(iter(video_duration.values()))
+                source_duration = float(duration or 0.0)
+            else:
+                source_duration = float(video_duration)
             start = max(0.0, clip.start)
-            end = min(video_duration, clip.end, start + self.MAX_CLIP_DURATION)
+            # 不能为了满足单段上限重新截断已经通过完整表达校验的候选。
+            end = min(source_duration, clip.end)
             if end - start < self.MIN_CLIP_DURATION:
                 return None
             return clip.model_copy(update={"start": start, "end": end})
@@ -113,7 +125,7 @@ class ScriptAgent(BaseAgent):
             if not uncovered:
                 break
 
-        for clip in sorted(highlights, key=lambda item: item.importance, reverse=True):
+        for clip in self._diverse_order(highlights, selected):
             candidate = normalise_clip(clip)
             if candidate is None:
                 continue
@@ -127,10 +139,67 @@ class ScriptAgent(BaseAgent):
             if total >= minimum_duration:
                 break
 
-        return sorted(selected, key=lambda item: item.start)
+        return sorted(
+            selected,
+            key=lambda item: (item.source_asset_id or "", item.start),
+        )
+
+    @classmethod
+    def _diverse_order(
+        cls,
+        highlights: Iterable[HighlightClip],
+        already_selected: Iterable[HighlightClip] = (),
+    ) -> list[HighlightClip]:
+        """MMR 风格贪心排序，降低重复讲话和单一来源连续占满预算的概率。"""
+        remaining = list(highlights)
+        chosen = list(already_selected)
+        ranked: list[HighlightClip] = []
+        while remaining:
+            source_counts = {
+                source_id: sum(item.source_asset_id == source_id for item in chosen)
+                for source_id in {item.source_asset_id for item in remaining}
+            }
+
+            def score(item: HighlightClip) -> tuple[float, float, float]:
+                repetition = max(
+                    (cls._text_similarity(item.text, kept.text) for kept in chosen),
+                    default=0.0,
+                )
+                source_penalty = 0.04 * source_counts.get(item.source_asset_id, 0)
+                return (
+                    item.importance - 0.35 * repetition - source_penalty,
+                    item.importance,
+                    -(item.end - item.start),
+                )
+
+            best = max(remaining, key=score)
+            remaining.remove(best)
+            ranked.append(best)
+            chosen.append(best)
+        return ranked
+
+    @staticmethod
+    def _text_similarity(left: str, right: str) -> float:
+        def tokens(value: str) -> set[str]:
+            compact = re.sub(r"\s+", "", value.lower())
+            chinese = re.findall(r"[\u4e00-\u9fff]", compact)
+            bigrams = {
+                "".join(chinese[index:index + 2])
+                for index in range(max(0, len(chinese) - 1))
+            }
+            words = set(re.findall(r"[a-z0-9]{2,}", compact))
+            return bigrams | words
+
+        left_tokens, right_tokens = tokens(left), tokens(right)
+        union = left_tokens | right_tokens
+        if not union:
+            return 0.0
+        return len(left_tokens & right_tokens) / len(union)
 
     @staticmethod
     def _overlap(left: HighlightClip, right: HighlightClip) -> bool:
+        if left.source_asset_id != right.source_asset_id:
+            return False
         return max(left.start, right.start) < min(left.end, right.end)
 
     def _build_remapped_srt(
@@ -146,6 +215,11 @@ class ScriptAgent(BaseAgent):
 
         for clip in clips:
             for segment in transcript:
+                if (
+                    clip.source_asset_id is not None
+                    and segment.source_asset_id != clip.source_asset_id
+                ):
+                    continue
                 start = max(segment.start, clip.start)
                 end = min(segment.end, clip.end)
                 if end <= start or not segment.text.strip():
@@ -192,6 +266,7 @@ class ScriptAgent(BaseAgent):
             HighlightClip(
                 start=operation.source_start,
                 end=operation.source_end,
+                source_asset_id=operation.source_asset_id,
                 text="",
                 importance=0.0,
                 category="transition",
@@ -244,7 +319,14 @@ class ScriptAgent(BaseAgent):
             return transcript
         selected = [
             segment for segment in transcript
-            if any(max(segment.start, clip.start) < min(segment.end, clip.end) for clip in clips)
+            if any(
+                (
+                    clip.source_asset_id is None
+                    or segment.source_asset_id == clip.source_asset_id
+                )
+                and max(segment.start, clip.start) < min(segment.end, clip.end)
+                for clip in clips
+            )
         ]
         if not selected:
             return transcript

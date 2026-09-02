@@ -37,12 +37,13 @@ from typing import Optional
 from src.agents.requirement_agent import RequirementAgent
 from src.agents.clarification_agent import RequirementClarificationAgent
 from src.agents.alignment_agent import RequirementAlignmentAgent
+from src.agents.material_interview_agent import MaterialInterviewAgent
 from src.agents.analysis_agent import AnalysisAgent
 from src.agents.candidate_agent import CandidateAgent
 from src.agents.style_agent import StyleRecommendationAgent
 from src.agents.script_agent import ScriptAgent
 from src.agents.executor_agent import ExecutorAgent
-from src.config import OUTPUT_DIR, WHISPER_MODEL_SIZE
+from src.config import DATABASE_URL, OUTPUT_DIR, REDIS_URL, WHISPER_MODEL_SIZE
 from src.tools.ffmpeg import FFmpegTool
 from src.tools.llm import model_call_context
 from src.models.schemas import (
@@ -54,22 +55,40 @@ from src.models.schemas import (
     Evidence,
     ExecutionBrief,
     ExecutionResult,
+    EditorExportResult,
     PipelineStatus,
     RequirementBrief,
     RequirementCompilation,
     RequirementItem,
+    RequirementSlot,
     RequirementSpec,
     HighlightClip,
     DeliveryReport,
     MaterialAlignmentDecision,
     MaterialAlignmentProposal,
+    MobileReviewLink,
+    MobileReviewSubmission,
     PlanApprovalException,
+    EntityReviewQueue,
+    ReferenceDocumentCategory,
+    ReferenceLibrary,
+    SourceAsset,
+    TaskMaterialSet,
 )
+from src.services.media_assets import MediaAssetService
+from src.services.mobile_review import MobileReviewService
+from src.services.infrastructure import (
+    PostgresTaskMetadataRepository,
+    build_idempotency_backend,
+)
+from src.services.editor_adapters import JianyingHandoffAdapter, OTIOAdapter
 from src.services.plans import EditPlanService
 from src.services.rendering import FFmpegRenderBackend
 from src.services.requirements import RequirementClarificationService
+from src.services.reference_documents import ReferenceDocumentService
 from src.services.state_machine import TaskStateMachine
 from src.services.task_store import TaskStore
+from src.services.timeline_ir import TimelineCompiler
 from src.services.verification import VerificationEngine
 
 logger = logging.getLogger("Orchestrator")
@@ -98,15 +117,24 @@ class VideoEditOrchestrator:
         self.agent1 = RequirementAgent()
         self.clarification_agent = RequirementClarificationAgent()
         self.alignment_agent = RequirementAlignmentAgent()
+        self.material_interview_agent = MaterialInterviewAgent()
         self.agent2 = AnalysisAgent(whisper_model_size=WHISPER_MODEL_SIZE)
         self.candidate_agent = CandidateAgent()
         self.style_agent = StyleRecommendationAgent()
         self.agent3 = ScriptAgent()
         self.agent4 = ExecutorAgent()
         self.plan_service = EditPlanService()
+        self.media_asset_service = MediaAssetService()
+        self.timeline_compiler = TimelineCompiler()
+        self.reference_document_service = ReferenceDocumentService()
+        self.mobile_review_service = MobileReviewService()
         self.clarification_service = RequirementClarificationService()
         self.verification_engine = VerificationEngine()
         self.render_backend = FFmpegRenderBackend(self.agent4)
+        self.metadata_repository = (
+            PostgresTaskMetadataRepository(DATABASE_URL) if DATABASE_URL else None
+        )
+        self.idempotency_backend = None
 
         self.status = PipelineStatus(step="init")
         self.task_dir: Path | None = None
@@ -133,14 +161,24 @@ class VideoEditOrchestrator:
         else:
             orchestrator = cls.__new__(cls)
             for name in (
-                "agent1", "clarification_agent", "alignment_agent", "agent2", "candidate_agent", "style_agent", "agent3", "agent4",
-                "plan_service", "clarification_service", "verification_engine", "render_backend",
+                "agent1", "clarification_agent", "alignment_agent", "material_interview_agent", "agent2", "candidate_agent", "style_agent", "agent3", "agent4",
+                "plan_service", "media_asset_service", "timeline_compiler", "reference_document_service", "mobile_review_service", "clarification_service", "verification_engine", "render_backend", "metadata_repository",
             ):
                 value = getattr(runtime, name, None)
                 if name == "clarification_agent" and value is None:
                     value = RequirementClarificationAgent()
                 if name == "alignment_agent" and value is None:
                     value = RequirementAlignmentAgent()
+                if name == "material_interview_agent" and value is None:
+                    value = MaterialInterviewAgent()
+                if name == "media_asset_service" and value is None:
+                    value = MediaAssetService()
+                if name == "timeline_compiler" and value is None:
+                    value = TimelineCompiler()
+                if name == "reference_document_service" and value is None:
+                    value = ReferenceDocumentService()
+                if name == "mobile_review_service" and value is None:
+                    value = MobileReviewService()
                 setattr(orchestrator, name, value)
         orchestrator.task_dir = task_dir
         orchestrator.store = TaskStore(task_dir)
@@ -154,7 +192,14 @@ class VideoEditOrchestrator:
         manifest_path = task_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         orchestrator.video_path = manifest.get("video_path")
+        if (task_dir / "material_set.json").exists():
+            orchestrator.status.material_set = orchestrator.store.read_model(
+                "material_set.json", TaskMaterialSet
+            )
         orchestrator._render_lock = threading.Lock()
+        orchestrator.idempotency_backend = build_idempotency_backend(
+            task_dir, REDIS_URL
+        )
 
         def latest(prefix: str, suffix: str = ".json") -> Optional[Path]:
             matches = list(task_dir.glob(f"{prefix}_v*{suffix}"))
@@ -327,32 +372,14 @@ class VideoEditOrchestrator:
 
     def _analyze_material_alignment(
         self,
-        video_path: str,
+        analysis: ContentAnalysis,
         compilation: RequirementCompilation,
     ) -> RequirementCompilation:
-        """在任务书确认前理解素材，并缓存转录供正式候选分析复用。"""
+        """使用已独立转录的聚合只读视图生成需求对齐建议。"""
         alignment_agent = getattr(self, "alignment_agent", None)
-        analysis_agent = getattr(self, "agent2", None)
-        if alignment_agent is None or analysis_agent is None or not self.store:
+        if alignment_agent is None or not self.store:
             return compilation
         try:
-            with model_call_context(
-                self.task_dir,
-                stage="material_understanding",
-                prompt_template_version="material-summary-v1",
-                input_spec_id=compilation.spec.id,
-                input_spec_version=compilation.spec.version,
-            ):
-                analysis = analysis_agent.run(video_path, compilation.legacy_requirement)
-            self.store.write_model("material_analysis.json", analysis)
-            self.store.write_payload(
-                "transcript.json",
-                {"segments": [item.model_dump(mode="json") for item in analysis.transcript]},
-            )
-            self.store.write_payload(
-                "evidence.json",
-                {"evidence": [item.model_dump(mode="json") for item in analysis.evidence]},
-            )
             if not any(item.type == "transcript" for item in analysis.evidence):
                 return compilation.model_copy(update={
                     "warnings": [
@@ -387,6 +414,103 @@ class VideoEditOrchestrator:
                 ]
             })
 
+    def _generate_material_interview_questions(
+        self,
+        compilation: RequirementCompilation,
+        analysis: ContentAnalysis,
+    ) -> RequirementCompilation:
+        """把素材证据驱动的问题转换为 UI 已支持的逐题确认槽位。"""
+        interview_agent = getattr(self, "material_interview_agent", None)
+        if interview_agent is None or not self.store:
+            return compilation
+        pending_count = sum(bool(slot.question) for slot in compilation.slots)
+        remaining = max(0, 5 - pending_count)
+        if remaining == 0:
+            return compilation
+        labels = {
+            source.id: source.filename
+            for source in (self.status.material_set.sources if self.status.material_set else [])
+        }
+        version = compilation.spec.version
+        try:
+            with model_call_context(
+                self.task_dir,
+                stage="material_interview",
+                prompt_template_version="material-interview-v1-tools",
+                input_spec_id=compilation.spec.id,
+                input_spec_version=version,
+            ):
+                questions = interview_agent.run(
+                    raw_text=compilation.brief.raw_text,
+                    spec=compilation.spec,
+                    analysis=analysis,
+                    scenario=compilation.brief.scenario,
+                    source_labels=labels,
+                    max_questions=remaining,
+                )
+            label_names = {
+                "retain": "希望保留的内容",
+                "exclude": "不希望出现的内容",
+                "order": "内容顺序",
+                "emphasis": "重点展开方式",
+                "risk": "需人工核对的信息",
+            }
+            dynamic_slots = []
+            for question in questions:
+                suffix = hashlib.sha256(
+                    (question.question + "|" + "|".join(question.supporting_evidence_ids)).encode("utf-8")
+                ).hexdigest()[:10]
+                dynamic_slots.append(
+                    RequirementSlot(
+                        key=f"material_{question.decision_type}_{suffix}",
+                        label=label_names[question.decision_type],
+                        status="missing",
+                        risk_level="high" if question.decision_type == "risk" else "medium",
+                        source_type="llm",
+                        source_ref=f"material-interview:{question.id}",
+                        question=question.question,
+                        question_reason=question.reason,
+                        question_impact=question.impact,
+                        answer_hint=question.answer_hint,
+                        question_source=f"material-interview-agent:{compilation.spec.id}:v{version}",
+                        supporting_evidence_ids=question.supporting_evidence_ids,
+                        source_asset_ids=question.source_asset_ids,
+                    )
+                )
+            revised_slots = [*compilation.slots, *dynamic_slots]
+            revised_spec = compilation.spec.model_copy(update={
+                "open_questions": [
+                    slot.question for slot in revised_slots if slot.question
+                ][:5]
+            })
+            self._write_json(
+                f"material_interview_questions_v{version}.json",
+                {
+                    "source": "ai_with_retrieved_evidence",
+                    "prompt_template_version": "material-interview-v1-tools",
+                    "questions": [item.model_dump(mode="json") for item in questions],
+                },
+            )
+            return compilation.model_copy(
+                update={"spec": revised_spec, "slots": revised_slots}
+            )
+        except Exception as error:
+            self._write_json(
+                f"material_interview_questions_v{version}.json",
+                {
+                    "source": "ai_failed",
+                    "prompt_template_version": "material-interview-v1-tools",
+                    "questions": [],
+                    "error_type": type(error).__name__,
+                },
+            )
+            return compilation.model_copy(update={
+                "warnings": [
+                    *compilation.warnings,
+                    "AI 本次未能根据素材生成进一步问题；这不会阻止你直接审核任务书。",
+                ]
+            })
+
     def create_requirement_draft(
         self,
         video_path: str | list[str],
@@ -400,6 +524,18 @@ class VideoEditOrchestrator:
         self.task_dir = OUTPUT_DIR / "tasks" / uuid.uuid4().hex
         self.task_dir.mkdir(parents=True, exist_ok=False)
         self.store = TaskStore(self.task_dir)
+        self.idempotency_backend = build_idempotency_backend(
+            self.task_dir, REDIS_URL
+        )
+        metadata_repository = getattr(self, "metadata_repository", None)
+        if metadata_repository is not None:
+            try:
+                metadata_repository.initialise()
+            except Exception as error:
+                logger.warning(
+                    "PostgreSQL 元数据仓库初始化失败，继续使用本地任务文件: %s",
+                    error,
+                )
         self.state_machine = TaskStateMachine(self.task_dir)
         self.status.task_snapshot = self.state_machine.initialise()
         self.preview_paths = {}
@@ -421,48 +557,34 @@ class VideoEditOrchestrator:
         if not source_paths:
             reject_preflight("请至少上传一段视频素材")
 
-        source_entries = []
-        timeline_offset = 0.0
-        for index, source_path in enumerate(source_paths, start=1):
-            source_info = FFmpegTool.get_video_info(source_path)
-            if not source_info:
-                reject_preflight(f"第 {index} 段素材无法读取，请重新上传")
-            duration = float(source_info.get("duration", 0))
-            if duration <= 0:
-                reject_preflight(f"第 {index} 段素材时长无效，请重新上传")
-            source_entries.append({
-                "order": index,
-                "source_path": source_path,
-                "timeline_start": timeline_offset,
-                "timeline_end": timeline_offset + duration,
-                "duration": duration,
-                "has_audio": bool(source_info.get("has_audio")),
-            })
-            timeline_offset += duration
-
-        if not any(item["has_audio"] for item in source_entries):
-            reject_preflight("视频预检失败：上传的素材都没有可用音频流")
-
-        if len(source_paths) > 1:
-            merged_path = self.task_dir / "merged_source.mp4"
-            if not FFmpegTool.concatenate_source_videos(source_paths, str(merged_path)):
-                reject_preflight("多段素材合并失败，请检查素材格式后重试")
-            self.video_path = str(merged_path.resolve())
-        else:
-            self.video_path = source_paths[0]
+        media_asset_service = getattr(self, "media_asset_service", None) or MediaAssetService()
+        self.media_asset_service = media_asset_service
+        try:
+            material_set = media_asset_service.register(self.store.task_id, source_paths)
+        except ValueError as error:
+            reject_preflight(str(error))
+            raise
+        self.status.material_set = material_set
+        self.store.write_model("material_set.json", material_set)
+        self.video_path = source_paths[0]
 
         self._write_json(
             "source_media.json",
             {
-                "merge_strategy": "upload_order",
-                "merged_video_path": self.video_path,
-                "sources": source_entries,
+                "schema_version": 3,
+                "analysis_strategy": "independent_sources",
+                "merged_video_path": None,
+                "sources": [item.model_dump(mode="json") for item in material_set.sources],
             },
         )
-        media_info = FFmpegTool.get_video_info(self.video_path)
-        if not media_info or not media_info.get("has_audio"):
-            reject_preflight("视频预检失败：需要可解码的视频和音频流")
-        self._write_json("media_info.json", media_info)
+        self._write_json(
+            "media_info.json",
+            {
+                "source_count": len(material_set.sources),
+                "total_duration": sum(item.duration for item in material_set.sources),
+                "audio_source_count": sum(item.has_audio for item in material_set.sources),
+            },
+        )
         self._transition("preflight_passed", "preflight-passed")
         self._write_manifest(
             "preflight_ok",
@@ -482,11 +604,42 @@ class VideoEditOrchestrator:
                     submitted_by=submitted_by,
                     overrides=overrides,
                 )
-            compilation = self._analyze_material_alignment(self.video_path, compilation)
+            aggregate_analysis: ContentAnalysis | None = None
+            analysis_agent = getattr(self, "agent2", None)
+            if analysis_agent is not None:
+                def analyze_source(source: SourceAsset) -> ContentAnalysis:
+                    with model_call_context(
+                        self.task_dir,
+                        stage="material_understanding",
+                        prompt_template_version="material-summary-v2-per-source",
+                        input_spec_id=compilation.spec.id,
+                        input_spec_version=compilation.spec.version,
+                    ):
+                        return analysis_agent.run(
+                            source.source_path,
+                            compilation.legacy_requirement,
+                            source_asset_id=source.id,
+                        )
+
+                material_set, aggregate_analysis = media_asset_service.analyze(
+                    material_set,
+                    compilation.legacy_requirement,
+                    analysis_agent,
+                    self.store,
+                    run_in_context=analyze_source,
+                )
+                self.status.material_set = material_set
+                compilation = self._analyze_material_alignment(
+                    aggregate_analysis, compilation
+                )
             proposal = compilation.alignment_proposal
             # 有明显模糊或错位时，先让用户决定是否采用素材驱动建议；决定后再动态追问。
             if proposal is None or not proposal.requires_user_decision:
                 compilation = self._generate_clarification_questions(compilation)
+                if aggregate_analysis is not None:
+                    compilation = self._generate_material_interview_questions(
+                        compilation, aggregate_analysis
+                    )
         except Exception as error:
             self._fail_task("requirement_compilation_failed", error)
             raise
@@ -682,6 +835,14 @@ class VideoEditOrchestrator:
             alignment_proposal=proposal,
         )
         compilation = self._generate_clarification_questions(compilation)
+        material_analysis_path = self.task_dir / "material_analysis.json"
+        if material_analysis_path.exists():
+            material_analysis = self.store.read_model(
+                "material_analysis.json", ContentAnalysis
+            )
+            compilation = self._generate_material_interview_questions(
+                compilation, material_analysis
+            )
         revised_spec = compilation.spec
         revised_execution = compilation.execution_brief.model_copy(update={
             "visible_instruction": RequirementAgent._build_visible_instruction(revised_spec),
@@ -1067,7 +1228,7 @@ class VideoEditOrchestrator:
                     self.status.execution_brief,
                     spec.requirements,
                     analysis.evidence,
-                    analysis.video_duration,
+                    analysis.source_durations or analysis.video_duration,
                     target_duration=spec.target_duration,
                     duration_tolerance=spec.duration_tolerance,
                     transcript=analysis.transcript,
@@ -1079,6 +1240,7 @@ class VideoEditOrchestrator:
             HighlightClip(
                 start=candidate.source_start,
                 end=candidate.source_end,
+                source_asset_id=candidate.source_asset_id,
                 text=" / ".join(citation.quote for citation in candidate.citations),
                 importance=candidate.confidence,
                 category="highlight",
@@ -1112,9 +1274,18 @@ class VideoEditOrchestrator:
                 "failed_requirement_ids": getattr(
                     generation, "failed_requirement_ids", []
                 ),
+                "duration_plan": (
+                    generation.duration_plan.model_dump(mode="json")
+                    if getattr(generation, "duration_plan", None) else None
+                ),
+                "retrieval_degradation_reason": getattr(
+                    generation, "retrieval_degradation_reason", None
+                ),
                 "rejected_candidate_ids": [item.id for item in rejected_candidates],
             },
         )
+        if getattr(generation, "duration_plan", None):
+            self.store.write_model("duration_budget.json", generation.duration_plan)
         self.store.write_payload(
             "retrieval_trace.json",
             {
@@ -1141,6 +1312,20 @@ class VideoEditOrchestrator:
             {"segments": [item.model_dump(mode="json") for item in analysis.transcript]},
         )
         self.store.write_model("analysis.json", analysis)
+        if (self.task_dir / "reference_library.json").exists():
+            library = self.store.read_model("reference_library.json", ReferenceLibrary)
+            previous_queue = (
+                self.store.read_model("entity_review_queue.json", EntityReviewQueue)
+                if (self.task_dir / "entity_review_queue.json").exists()
+                else None
+            )
+            queue = self.reference_document_service.build_entity_queue(
+                task_id=self.store.task_id,
+                analysis=analysis,
+                library=library,
+                previous=previous_queue,
+            )
+            self.store.write_model("entity_review_queue.json", queue)
         try:
             script = self.agent3.run(
                 analysis,
@@ -1165,7 +1350,7 @@ class VideoEditOrchestrator:
         self.status.plan_gate = plan_gate
         self.store.write_model("edit_plan.json", script)
         if generate_previews:
-            self.preview_paths = self._create_previews(video_path, script)
+            self.preview_paths = self._create_previews_for_sources(script)
         self._transition("review_ready", f"review-ready-plan-v{plan.version}")
         self.status.step = self.status.task_snapshot.state
         self._write_manifest(
@@ -1174,6 +1359,160 @@ class VideoEditOrchestrator:
             edit_plan_version=str(plan.version),
         )
         return script
+
+    def add_reference_document(
+        self,
+        path: str,
+        category: ReferenceDocumentCategory,
+        *,
+        actor_id: Optional[str] = None,
+    ) -> ReferenceLibrary:
+        """上传活动资料并生成可定位证据；不会自动改写字幕或专有名词。"""
+        if not self.store or not self.task_dir:
+            raise ValueError("请先创建视频任务")
+        service = (
+            getattr(self, "reference_document_service", None)
+            or ReferenceDocumentService()
+        )
+        previous = (
+            self.store.read_model("reference_library.json", ReferenceLibrary)
+            if (self.task_dir / "reference_library.json").exists()
+            else None
+        )
+        library = service.ingest(
+            task_id=self.store.task_id,
+            path=path,
+            category=category,
+            library=previous,
+        )
+        self.store.write_model("reference_library.json", library)
+        analysis = self.status.analysis
+        if analysis is None and (self.task_dir / "material_analysis.json").exists():
+            analysis = self.store.read_model("material_analysis.json", ContentAnalysis)
+        if analysis is not None:
+            previous_queue = (
+                self.store.read_model("entity_review_queue.json", EntityReviewQueue)
+                if (self.task_dir / "entity_review_queue.json").exists()
+                else None
+            )
+            queue = service.build_entity_queue(
+                task_id=self.store.task_id,
+                analysis=analysis,
+                library=library,
+                previous=previous_queue,
+            )
+            self.store.write_model("entity_review_queue.json", queue)
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action="reference_document_added",
+                subject_type="ReferenceLibrary",
+                subject_id=self.store.task_id,
+                subject_version=library.version,
+                actor_type="user",
+                actor_id=actor_id,
+                summary=f"用户上传了 {category} 类活动资料，系统生成了可定位文字证据。",
+                metadata={"category": category, "filename": Path(path).name},
+            )
+        )
+        return library
+
+    def retry_source_analysis(
+        self,
+        source_asset_id: str,
+        *,
+        retry_reason: str,
+        actor_id: Optional[str] = None,
+    ) -> TaskMaterialSet:
+        """在候选审核前只重试一段失败素材，其他转录和索引不重复生成。"""
+        if not self.store or not self.task_dir or not self.status.material_set:
+            raise ValueError("当前任务没有可重试的素材分析")
+        state = self.status.task_snapshot.state if self.status.task_snapshot else ""
+        if state not in {
+            "requirement_draft", "awaiting_requirement_clarification",
+            "requirement_confirmed", "style_recommended", "style_skipped",
+        }:
+            raise ValueError("候选计划生成后不能直接替换素材分析；请先创建新的分析版本")
+        requirement = self.status.requirement
+        if requirement is None:
+            raise ValueError("缺少当前任务书的兼容执行参数")
+        service = getattr(self, "media_asset_service", None) or MediaAssetService()
+
+        def analyze_source(source: SourceAsset) -> ContentAnalysis:
+            spec = self.status.requirement_spec
+            with model_call_context(
+                self.task_dir,
+                stage="source_analysis_retry",
+                prompt_template_version="material-summary-v2-per-source",
+                input_spec_id=spec.id if spec else None,
+                input_spec_version=spec.version if spec else None,
+            ):
+                return self.agent2.run(
+                    source.source_path,
+                    requirement,
+                    source_asset_id=source.id,
+                )
+
+        material_set, _ = service.retry_source(
+            self.status.material_set,
+            source_asset_id=source_asset_id,
+            requirement=requirement,
+            analysis_agent=self.agent2,
+            store=self.store,
+            retry_reason=retry_reason,
+            run_in_context=analyze_source,
+        )
+        self.status.material_set = material_set
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action="source_analysis_retried",
+                subject_type="SourceAsset",
+                subject_id=source_asset_id,
+                actor_type="user",
+                actor_id=actor_id,
+                summary="系统只重新分析了用户指定的来源素材，其他素材结果保持不变。",
+                metadata={"retry_reason": retry_reason},
+            )
+        )
+        return material_set
+
+    def resolve_entity_review(
+        self,
+        item_id: str,
+        action: str,
+        *,
+        actor_id: Optional[str] = None,
+        edited_value: Optional[str] = None,
+    ) -> EntityReviewQueue:
+        """确认、拒绝或修改一个专有名词建议，不静默改写 ASR 原文。"""
+        if not self.store or not self.task_dir:
+            raise ValueError("请先创建视频任务")
+        if not (self.task_dir / "entity_review_queue.json").exists():
+            raise ValueError("当前没有待核对的专有名词")
+        queue = self.store.read_model("entity_review_queue.json", EntityReviewQueue)
+        updated = ReferenceDocumentService.resolve(
+            queue,
+            item_id=item_id,
+            action=action,
+            actor_id=actor_id,
+            edited_value=edited_value,
+        )
+        self.store.write_model("entity_review_queue.json", updated)
+        self.store.write_model(f"entity_review_queue_v{updated.version}.json", updated)
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action=f"entity_review_{action}",
+                subject_type="EntityReviewItem",
+                subject_id=item_id,
+                subject_version=updated.version,
+                actor_type="user",
+                actor_id=actor_id,
+                summary="用户处理了一项专有名词核对建议。",
+            )
+        )
+        return updated
 
     def render(self, script: EditScript, video_path: str, output_path: str = "") -> ExecutionResult:
         """兼容入口；只接受当前已批准计划完全匹配的执行视图。"""
@@ -1217,7 +1556,8 @@ class VideoEditOrchestrator:
                     or "用户人工确认该时间段应进入成片"
                 ).strip()
                 fingerprint = (
-                    f"{self.store.task_id}|{start:.3f}|{end:.3f}|{annotation}"
+                    f"{self.store.task_id}|{raw.get('source_asset_id') or 'legacy'}|"
+                    f"{start:.3f}|{end:.3f}|{annotation}"
                 ).encode("utf-8")
                 digest = hashlib.sha256(fingerprint).hexdigest()
                 evidence_id = f"user_evidence_{digest[:16]}"
@@ -1225,6 +1565,7 @@ class VideoEditOrchestrator:
                     evidence.append(
                         Evidence(
                             id=evidence_id,
+                            source_asset_id=raw.get("source_asset_id"),
                             type="user_annotation",
                             source_start=start,
                             source_end=end,
@@ -1233,6 +1574,7 @@ class VideoEditOrchestrator:
                             metadata={
                                 "actor_id": actor_id,
                                 "source": "manual_timeline_add",
+                                "source_asset_id": raw.get("source_asset_id"),
                             },
                         )
                     )
@@ -1319,6 +1661,115 @@ class VideoEditOrchestrator:
         )
         return revised
 
+    def create_mobile_review_link(
+        self,
+        *,
+        base_url: str = "http://127.0.0.1:7961",
+        ttl_hours: int = 24,
+        actor_id: Optional[str] = None,
+    ) -> MobileReviewLink:
+        """为当前待审计划创建可过期、可撤销的手机审批链接。"""
+        if not self.store or not self.status.edit_plan:
+            raise ValueError("当前没有可发起手机审核的计划")
+        service = getattr(self, "mobile_review_service", None) or MobileReviewService()
+        link = service.issue(
+            store=self.store,
+            plan=self.status.edit_plan,
+            base_url=base_url,
+            ttl_hours=ttl_hours,
+            created_by=actor_id,
+        )
+        self.store.write_model("latest_mobile_review_link.json", link)
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action="mobile_review_link_created",
+                subject_type="AuditableEditPlan",
+                subject_id=self.status.edit_plan.id,
+                subject_version=self.status.edit_plan.version,
+                actor_type="user",
+                actor_id=actor_id,
+                summary=f"用户创建了有效期 {ttl_hours} 小时的手机审核链接。",
+            )
+        )
+        return link
+
+    def revoke_latest_mobile_review_link(
+        self,
+        *,
+        actor_id: Optional[str] = None,
+    ) -> MobileReviewLink:
+        """撤销桌面端最近创建的审核链接，并保留审计记录。"""
+        if not self.store or not self.task_dir:
+            raise ValueError("当前没有可撤销的手机审核链接")
+        path = self.task_dir / "latest_mobile_review_link.json"
+        if not path.exists():
+            raise ValueError("当前没有可撤销的手机审核链接")
+        link = self.store.read_model("latest_mobile_review_link.json", MobileReviewLink)
+        service = getattr(self, "mobile_review_service", None) or MobileReviewService()
+        service.revoke(self.store, link.token_record_id)
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action="mobile_review_link_revoked",
+                subject_type="AuditableEditPlan",
+                subject_id=link.plan_id,
+                subject_version=link.plan_version,
+                actor_type="user",
+                actor_id=actor_id,
+                summary="用户撤销了当前手机审核链接。",
+            )
+        )
+        return link
+
+    def apply_latest_mobile_review(self) -> MobileReviewSubmission:
+        """在桌面端应用手机提交；同一提交只应用一次。"""
+        if not self.store or not self.task_dir or not self.status.edit_plan:
+            raise ValueError("当前没有可应用移动审核的计划")
+        submissions_path = self.task_dir / "mobile_review_submissions.json"
+        if not submissions_path.exists():
+            raise ValueError("尚未收到手机审核结果")
+        payload = json.loads(submissions_path.read_text(encoding="utf-8"))
+        submissions = [
+            MobileReviewSubmission.model_validate(item)
+            for item in payload.get("submissions", [])
+        ]
+        plan = self.status.edit_plan
+        submission = next(
+            (
+                item for item in reversed(submissions)
+                if item.plan_id == plan.id and item.plan_version == plan.version
+            ),
+            None,
+        )
+        if submission is None:
+            raise ValueError("手机审核结果不属于当前计划版本")
+        applied_path = self.task_dir / "mobile_review_applied.json"
+        applied = (
+            json.loads(applied_path.read_text(encoding="utf-8"))
+            if applied_path.exists() else {"submission_ids": []}
+        )
+        if submission.id in applied.get("submission_ids", []):
+            return submission
+        actor = submission.reviewer_name or "mobile-reviewer"
+        if submission.decision == "approve":
+            self.approve_current_plan(actor)
+        else:
+            if not submission.comment.strip():
+                raise ValueError("手机端退回修改必须填写意见")
+            gate = self.store.resolve_gate(
+                self.status.plan_gate.id,
+                "changes_requested",
+                actor,
+                submission.comment,
+            )
+            self.status.plan_gate = gate
+        applied["submission_ids"] = [
+            *applied.get("submission_ids", []), submission.id
+        ]
+        self._write_json("mobile_review_applied.json", applied)
+        return submission
+
     def approve_current_plan(
         self,
         actor_id: Optional[str] = None,
@@ -1334,7 +1785,7 @@ class VideoEditOrchestrator:
             self.status.edit_plan,
             self.status.requirement_spec,
             self.status.analysis.candidate_clips,
-            self.status.analysis.video_duration,
+            self.status.analysis.source_durations or self.status.analysis.video_duration,
             known_evidence_ids=[item.id for item in self.status.analysis.evidence],
             user_annotation_evidence_ids=[
                 item.id for item in self.status.analysis.evidence
@@ -1412,6 +1863,20 @@ class VideoEditOrchestrator:
             "confirmed_edit_plan.json",
             approved.execution_script.model_dump(),
         )
+        if self.status.material_set:
+            timeline_compiler = (
+                getattr(self, "timeline_compiler", None) or TimelineCompiler()
+            )
+            canonical_timeline = timeline_compiler.compile(
+                task_id=self.store.task_id,
+                plan=approved,
+                material_set=self.status.material_set,
+            )
+            self.store.write_model(
+                f"canonical_timeline_v{canonical_timeline.version}.json",
+                canonical_timeline,
+            )
+            self.store.write_model("canonical_timeline.json", canonical_timeline)
         self._transition(
             "plan_approved",
             f"plan-approved-v{approved.version}",
@@ -1420,6 +1885,66 @@ class VideoEditOrchestrator:
         self.status.step = self.status.task_snapshot.state
         self._write_manifest(self.status.step, edit_plan_version=str(approved.version))
         return approved
+
+    def export_editor_package(
+        self,
+        adapter: str,
+        output_dir: str = "",
+        *,
+        render_clips: bool = True,
+    ) -> EditorExportResult:
+        """从已批准通用时间线导出独立交接包，失败不改变任务状态。"""
+        if not self.store or not self.task_dir or not self.status.edit_plan:
+            raise ValueError("当前任务没有可导出的剪辑计划")
+        plan = self.status.edit_plan
+        if plan.status != "approved" or not self.status.material_set:
+            raise ValueError("请先批准当前剪辑计划")
+        compiler = getattr(self, "timeline_compiler", None) or TimelineCompiler()
+        timeline = compiler.compile(
+            task_id=self.store.task_id,
+            plan=plan,
+            material_set=self.status.material_set,
+        )
+        self.store.write_model("canonical_timeline.json", timeline)
+        if not output_dir:
+            output_dir = str(
+                self.task_dir / "editor_exports" / f"{adapter}_v{plan.version}"
+            )
+        if adapter == "jianying":
+            exporter = JianyingHandoffAdapter(render_clips=render_clips)
+        elif adapter == "otio":
+            exporter = OTIOAdapter()
+        else:
+            raise ValueError("当前支持的导出目标为 jianying 或 otio")
+        try:
+            result = exporter.export(timeline, Path(output_dir))
+        except Exception as error:
+            result = EditorExportResult(
+                adapter=adapter,
+                timeline_id=timeline.id,
+                timeline_version=timeline.version,
+                success=False,
+                output_path=str(Path(output_dir).resolve()),
+                errors=[f"adapter_exception:{type(error).__name__}:{error}"],
+            )
+        self.store.write_model(
+            f"editor_export_{adapter}_v{plan.version}.json", result
+        )
+        self.store.append_audit(
+            AuditEvent(
+                task_id=self.store.task_id,
+                action="editor_export_completed" if result.success else "editor_export_failed",
+                subject_type="CanonicalTimeline",
+                subject_id=timeline.id,
+                subject_version=timeline.version,
+                summary=(
+                    f"系统生成了 {adapter} 编辑器交接结果。"
+                    if result.success else f"{adapter} 编辑器交接导出失败，已批准计划未改变。"
+                ),
+                metadata={"adapter": adapter, "success": result.success},
+            )
+        )
+        return result
 
     def render_approved_plan(
         self,
@@ -1433,9 +1958,16 @@ class VideoEditOrchestrator:
             self._render_lock = render_lock
         if not render_lock.acquire(blocking=False):
             raise ValueError("当前任务正在渲染，请勿重复提交")
+        idempotency = getattr(self, "idempotency_backend", None)
+        key = f"render:{self.store.task_id if self.store else 'unknown'}:{plan.version}"
+        if idempotency is not None and not idempotency.acquire(key, 3600):
+            render_lock.release()
+            raise ValueError("当前计划正在渲染，请勿重复提交")
         try:
             return self._render_approved_plan_locked(plan, video_path, output_path)
         finally:
+            if idempotency is not None:
+                idempotency.release(key)
             render_lock.release()
 
     def _render_approved_plan_locked(
@@ -1469,7 +2001,13 @@ class VideoEditOrchestrator:
             )
         backend = getattr(self, "render_backend", None) or FFmpegRenderBackend(self.agent4)
         try:
-            result = backend.render(plan.execution_script, video_path, output_path)
+            render_sources: str | dict[str, str] = video_path
+            if self.status.material_set:
+                render_sources = {
+                    source.id: source.source_path
+                    for source in self.status.material_set.sources
+                }
+            result = backend.render(plan.execution_script, render_sources, output_path)
         except Exception as error:
             result = ExecutionResult(
                 success=False,
@@ -1652,6 +2190,38 @@ class VideoEditOrchestrator:
                 previews[str(operation.order)] = str(preview_path.resolve())
         return previews
 
+    def _create_previews_for_sources(self, script: EditScript) -> dict[str, str]:
+        """按每个操作的来源素材生成预览；单素材旧任务仍使用兼容路径。"""
+        if not self.status.material_set:
+            return self._create_previews(self.video_path or "", script)
+        source_paths = {
+            source.id: source.source_path for source in self.status.material_set.sources
+        }
+        if not self.task_dir:
+            return {}
+        preview_dir = self.task_dir / "previews"
+        preview_dir.mkdir(exist_ok=True)
+        previews: dict[str, str] = {}
+        for operation in script.operations:
+            if (
+                operation.action != "cut"
+                or operation.source_start is None
+                or operation.source_end is None
+            ):
+                continue
+            source_path = source_paths.get(operation.source_asset_id or "")
+            if not source_path:
+                continue
+            preview_path = preview_dir / f"clip_{operation.order:02d}.mp4"
+            if FFmpegTool.create_preview(
+                source_path,
+                operation.source_start,
+                operation.source_end,
+                str(preview_path),
+            ):
+                previews[str(operation.order)] = str(preview_path.resolve())
+        return previews
+
     def _transition(
         self,
         event: str,
@@ -1672,6 +2242,22 @@ class VideoEditOrchestrator:
         )
         self.status.task_snapshot = updated
         self.status.step = updated.state
+        metadata_repository = getattr(self, "metadata_repository", None)
+        if metadata_repository is not None and self.store:
+            try:
+                metadata_repository.upsert(
+                    task_id=self.store.task_id,
+                    state=updated.state,
+                    state_version=updated.version,
+                    plan_version=(
+                        self.status.edit_plan.version
+                        if self.status.edit_plan else None
+                    ),
+                )
+            except Exception as error:
+                logger.warning(
+                    "PostgreSQL 元数据同步失败，本地状态仍有效: %s", error
+                )
         return updated
 
     def _fail_task(self, error_code: str, error: Exception) -> None:

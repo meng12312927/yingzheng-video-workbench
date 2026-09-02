@@ -203,6 +203,8 @@ class RequirementSlot(BaseModel):
     question_impact: Optional[str] = None
     answer_hint: Optional[str] = None
     question_source: Optional[str] = None
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    source_asset_ids: list[str] = Field(default_factory=list)
     updated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -214,6 +216,19 @@ class ClarificationQuestion(BaseModel):
     reason: str = Field(min_length=2, max_length=240)
     impact: str = Field(min_length=2, max_length=240)
     answer_hint: Optional[str] = Field(default=None, max_length=160)
+
+
+class MaterialInterviewQuestion(BaseModel):
+    """由素材证据触发的业务选择题；不要求用户理解或填写时间码。"""
+
+    id: str = Field(default_factory=lambda: new_id("material_question"))
+    decision_type: Literal["retain", "exclude", "order", "emphasis", "risk"]
+    question: str = Field(min_length=4, max_length=180)
+    reason: str = Field(min_length=2, max_length=300)
+    impact: str = Field(min_length=2, max_length=300)
+    answer_hint: Optional[str] = Field(default=None, max_length=180)
+    supporting_evidence_ids: list[str] = Field(default_factory=list, min_length=1, max_length=8)
+    source_asset_ids: list[str] = Field(default_factory=list, min_length=1, max_length=8)
 
 
 class MaterialAlignmentProposal(BaseModel):
@@ -420,6 +435,33 @@ class AuditEvent(BaseModel):
 # Agent 2 内部 / Agent 2 → Agent 3：内容分析结果
 # ============================================================
 
+SourceAnalysisState = Literal[
+    "pending", "preflight_ok", "transcribing", "ready",
+    "no_audio", "failed", "excluded",
+]
+
+
+class SourceAsset(BaseModel):
+    """任务中的一段原始素材；分析事实始终使用该文件的本地时间。"""
+
+    id: str = Field(default_factory=lambda: new_id("asset"))
+    order: int = Field(ge=1)
+    filename: str = Field(min_length=1)
+    source_path: str = Field(min_length=1)
+    content_hash: str = Field(min_length=1)
+    duration: float = Field(gt=0.0)
+    width: int = Field(default=0, ge=0)
+    height: int = Field(default=0, ge=0)
+    fps: Optional[float] = Field(default=None, gt=0.0)
+    codec: str = ""
+    size_mb: Optional[float] = Field(default=None, ge=0.0)
+    has_audio: bool = False
+    analysis_state: SourceAnalysisState = "pending"
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class TranscriptSegment(BaseModel):
     """
     单个转录片段
@@ -427,6 +469,10 @@ class TranscriptSegment(BaseModel):
     Whisper 输出的一小段文字，包含起止时间。
     """
     id: str = Field(default_factory=lambda: new_id("transcript"))
+    source_asset_id: Optional[str] = Field(
+        default=None,
+        description="所属原素材 ID；旧单素材任务可以为空",
+    )
     start: float = Field(description="开始时间（秒）")
     end: float = Field(description="结束时间（秒）")
     text: str = Field(description="转录文本")
@@ -437,6 +483,7 @@ class Evidence(BaseModel):
     """可供模型引用、并由代码验证的不可变证据片段。"""
 
     id: str = Field(default_factory=lambda: new_id("evidence"))
+    source_asset_id: Optional[str] = None
     type: Literal["transcript", "ocr", "scene", "audio", "user_annotation"] = "transcript"
     source_start: float = Field(ge=0.0)
     source_end: float = Field(gt=0.0)
@@ -467,6 +514,7 @@ class CandidateClip(BaseModel):
     """证据化候选；模型建议不会因缺少有效引用进入自动选段。"""
 
     id: str = Field(default_factory=lambda: new_id("candidate"))
+    source_asset_id: Optional[str] = None
     source_start: float = Field(ge=0.0)
     source_end: float = Field(gt=0.0)
     matched_requirement_ids: list[str] = Field(default_factory=list)
@@ -483,6 +531,31 @@ class CandidateClip(BaseModel):
         return self
 
 
+class RequirementDurationBudget(BaseModel):
+    """一项任务书要求在候选阶段应获得的确定性时长预算。"""
+
+    requirement_id: str
+    priority: Literal["must", "should", "optional"]
+    target_seconds: float = Field(ge=0.0)
+    minimum_seconds: float = Field(ge=0.0)
+    desired_candidate_count: int = Field(ge=1, le=8)
+
+
+class DurationBudgetPlan(BaseModel):
+    """分析前分配、分析后回填的时长预算与缺口。"""
+
+    target_duration: float = Field(gt=0.0)
+    duration_tolerance: float = Field(ge=0.0)
+    required_minimum: float = Field(ge=0.0)
+    content_budget: float = Field(ge=0.0)
+    atmosphere_budget: float = Field(ge=0.0)
+    requirement_budgets: list[RequirementDurationBudget] = Field(default_factory=list)
+    planned_candidate_duration: float = Field(default=0.0, ge=0.0)
+    shortage_seconds: float = Field(default=0.0, ge=0.0)
+    status: Literal["planned", "sufficient", "short"] = "planned"
+    recommendations: list[str] = Field(default_factory=list)
+
+
 class HighlightClip(BaseModel):
     """
     一个"高光片段"——被认为值得放进成片的部分
@@ -492,6 +565,7 @@ class HighlightClip(BaseModel):
     """
     start: float = Field(description="片段开始时间（秒）")
     end: float = Field(description="片段结束时间（秒）")
+    source_asset_id: Optional[str] = None
     text: str = Field(description="片段中的转录文本")
     importance: float = Field(
         ge=0.0, le=1.0,
@@ -519,6 +593,10 @@ class ContentAnalysis(BaseModel):
     包含完整的转录文本和筛选出的高光片段列表。
     """
     video_duration: float = Field(description="视频总时长（秒）")
+    source_durations: dict[str, float] = Field(
+        default_factory=dict,
+        description="各原素材的本地时长；多素材任务不能用总时长校验局部时间",
+    )
     transcript: list[TranscriptSegment] = Field(
         default_factory=list,
         description="完整转录文本"
@@ -545,6 +623,32 @@ class ContentAnalysis(BaseModel):
     )
 
 
+class SourceAnalysisResult(BaseModel):
+    """一段原素材的独立分析结果；失败不会污染其他素材。"""
+
+    source: SourceAsset
+    analysis: Optional[ContentAnalysis] = None
+    status: SourceAnalysisState = "pending"
+    warnings: list[str] = Field(default_factory=list)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    attempt_count: int = Field(default=0, ge=0)
+    last_retry_reason: Optional[str] = None
+    completed_at: Optional[datetime] = None
+
+
+class TaskMaterialSet(BaseModel):
+    """一个任务内的全部独立素材及聚合分析状态。"""
+
+    schema_version: int = Field(default=3, ge=3)
+    task_id: str
+    sources: list[SourceAsset] = Field(default_factory=list, min_length=1)
+    results: list[SourceAnalysisResult] = Field(default_factory=list)
+    status: Literal["registered", "analyzing", "ready", "partial", "failed"] = "registered"
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 # ============================================================
 # Agent 3 → Agent 4：剪辑脚本
 # ============================================================
@@ -556,6 +660,10 @@ class EditOperation(BaseModel):
     例如："从原片的第 60 秒裁到第 75 秒，作为成片的第 1 个片段"
     """
     order: int = Field(description="操作顺序号（从 1 开始）")
+    source_asset_id: Optional[str] = Field(
+        default=None,
+        description="cut 操作引用的原素材 ID；旧单素材脚本可以为空",
+    )
     action: str = Field(
         description="操作类型：cut(裁剪) / transition(转场) / title(标题) / subtitle(字幕段)"
     )
@@ -654,6 +762,7 @@ class TimelineSegment(BaseModel):
     id: str = Field(default_factory=lambda: new_id("timeline"))
     order: int = Field(ge=1)
     candidate_id: str
+    source_asset_id: Optional[str] = None
     source_start: float = Field(ge=0.0)
     source_end: float = Field(gt=0.0)
     output_start: float = Field(ge=0.0)
@@ -702,6 +811,218 @@ class AuditableEditPlan(BaseModel):
     status: Literal["draft", "approved", "superseded"] = "draft"
     created_at: datetime = Field(default_factory=utc_now)
     approved_at: Optional[datetime] = None
+
+
+class CanonicalTimelineSource(BaseModel):
+    """编辑器无关时间线引用的一段原素材。"""
+
+    source_asset_id: str
+    filename: str
+    source_path: str
+    content_hash: str = ""
+    duration: float = Field(gt=0.0)
+    fps: float = Field(default=30.0, gt=0.0)
+
+
+class CanonicalTimelineClip(BaseModel):
+    """所有 Adapter 共享的最小剪辑事实。"""
+
+    id: str = Field(default_factory=lambda: new_id("canonical_clip"))
+    order: int = Field(ge=1)
+    source_asset_id: str
+    source_in: float = Field(ge=0.0)
+    source_out: float = Field(gt=0.0)
+    timeline_in: float = Field(ge=0.0)
+    timeline_out: float = Field(gt=0.0)
+    candidate_id: str
+    matched_requirement_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    subtitle_text: Optional[str] = None
+    title_text: Optional[str] = None
+    transition_style: Literal["cut", "fade"] = "cut"
+    transition_duration: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_ranges(self):
+        if self.source_out <= self.source_in:
+            raise ValueError("CanonicalTimelineClip 源范围非法")
+        if self.timeline_out <= self.timeline_in:
+            raise ValueError("CanonicalTimelineClip 成片范围非法")
+        return self
+
+
+class CanonicalTimeline(BaseModel):
+    """审核计划编译出的编辑器无关事实来源。"""
+
+    schema_version: int = Field(default=1, ge=1)
+    id: str = Field(default_factory=lambda: new_id("canonical_timeline"))
+    version: int = Field(default=1, ge=1)
+    task_id: str
+    requirement_spec_id: str
+    requirement_spec_version: int = Field(ge=1)
+    approved_plan_id: str
+    approved_plan_version: int = Field(ge=1)
+    title: str = ""
+    sources: list[CanonicalTimelineSource] = Field(default_factory=list, min_length=1)
+    clips: list[CanonicalTimelineClip] = Field(default_factory=list)
+    subtitles_srt: str = ""
+    estimated_duration: float = Field(ge=0.0)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class EditorExportResult(BaseModel):
+    """一个 Adapter 的独立导出结果；失败不改变已批准计划。"""
+
+    adapter: str
+    timeline_id: str
+    timeline_version: int = Field(ge=1)
+    success: bool
+    output_path: str
+    artifacts: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+ReferenceDocumentCategory = Literal[
+    "agenda", "host_script", "people", "awards", "products",
+    "organizations", "terminology", "other",
+]
+
+
+class ReferenceDocument(BaseModel):
+    """用户上传的活动资料；原文件与解析证据分别版本化。"""
+
+    id: str = Field(default_factory=lambda: new_id("reference_document"))
+    task_id: str
+    version: int = Field(default=1, ge=1)
+    category: ReferenceDocumentCategory
+    filename: str
+    source_path: str
+    content_hash: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ReferenceDocumentEvidence(BaseModel):
+    """活动资料中的可核对文字及其行、单元格或 JSON 路径。"""
+
+    id: str = Field(default_factory=lambda: new_id("document_evidence"))
+    document_id: str
+    document_version: int = Field(ge=1)
+    category: ReferenceDocumentCategory
+    location: str
+    content: str = Field(min_length=1, max_length=1000)
+    content_hash: str
+
+
+class ReferenceLibrary(BaseModel):
+    """一个任务的辅助资料索引。"""
+
+    schema_version: int = Field(default=1, ge=1)
+    task_id: str
+    version: int = Field(default=1, ge=1)
+    documents: list[ReferenceDocument] = Field(default_factory=list)
+    evidence: list[ReferenceDocumentEvidence] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class EntityReviewItem(BaseModel):
+    """ASR 与权威资料之间的专有名词候选；永远等待用户确认。"""
+
+    id: str = Field(default_factory=lambda: new_id("entity_review"))
+    entity_type: Literal["person", "title", "award", "product", "organization", "term"]
+    source_asset_id: Optional[str] = None
+    transcript_segment_id: str
+    source_start: float = Field(ge=0.0)
+    source_end: float = Field(gt=0.0)
+    observed_text: str = Field(min_length=1)
+    suggested_text: str = Field(min_length=1)
+    reference_evidence_ids: list[str] = Field(default_factory=list, min_length=1)
+    similarity: float = Field(ge=0.0, le=1.0)
+    status: Literal["pending", "confirmed", "rejected", "edited"] = "pending"
+    confirmed_value: Optional[str] = None
+    actor_id: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+
+
+class EntityReviewQueue(BaseModel):
+    task_id: str
+    version: int = Field(default=1, ge=1)
+    items: list[EntityReviewItem] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+OrganizationMemoryKind = Literal[
+    "brand_rule", "proper_noun", "publishing_restriction", "template_rule",
+]
+
+
+class OrganizationMemoryItem(BaseModel):
+    """由组织明确维护的规则；每项都能查看来源、停用或删除。"""
+
+    id: str = Field(default_factory=lambda: new_id("organization_memory"))
+    kind: OrganizationMemoryKind
+    label: str = Field(min_length=1, max_length=120)
+    value: str = Field(min_length=1, max_length=1000)
+    aliases: list[str] = Field(default_factory=list)
+    source: str = Field(min_length=1, max_length=500)
+    status: Literal["active", "deleted"] = "active"
+    created_at: datetime = Field(default_factory=utc_now)
+    deleted_at: Optional[datetime] = None
+
+
+class OrganizationProfile(BaseModel):
+    """学校或企业的版本化品牌、术语、发布限制和模板配置。"""
+
+    schema_version: int = Field(default=1, ge=1)
+    id: str = Field(default_factory=lambda: new_id("organization"))
+    version: int = Field(default=1, ge=1)
+    name: str = Field(min_length=1, max_length=120)
+    scenario: Literal["school", "enterprise"]
+    items: list[OrganizationMemoryItem] = Field(default_factory=list)
+    status: Literal["active", "deleted"] = "active"
+    created_by: Optional[str] = Field(default=None, max_length=120)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    deleted_at: Optional[datetime] = None
+
+
+class MobileReviewTokenRecord(BaseModel):
+    """移动审核令牌只保存哈希，可过期和撤销。"""
+
+    id: str = Field(default_factory=lambda: new_id("mobile_token"))
+    task_id: str
+    plan_id: str
+    plan_version: int = Field(ge=1)
+    token_hash: str
+    status: Literal["active", "revoked", "used", "expired"] = "active"
+    expires_at: datetime
+    created_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class MobileReviewLink(BaseModel):
+    token_record_id: str
+    task_id: str
+    plan_id: str
+    plan_version: int = Field(ge=1)
+    url: str
+    expires_at: datetime
+    qr_code_path: Optional[str] = None
+
+
+class MobileReviewSubmission(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("mobile_submission"))
+    token_record_id: str
+    task_id: str
+    plan_id: str
+    plan_version: int = Field(ge=1)
+    decision: Literal["approve", "changes_requested"]
+    comment: str = Field(default="", max_length=1000)
+    reviewer_name: Optional[str] = Field(default=None, max_length=100)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class CandidateDecision(BaseModel):
@@ -812,6 +1133,7 @@ class PipelineStatus(BaseModel):
     requirement_gate: Optional[ReviewGate] = None
     task_snapshot: Optional[TaskSnapshot] = None
     style_proposals: list[StyleProposal] = Field(default_factory=list)
+    material_set: Optional[TaskMaterialSet] = None
     analysis: Optional[ContentAnalysis] = None
     script: Optional[EditScript] = None
     edit_plan: Optional[AuditableEditPlan] = None

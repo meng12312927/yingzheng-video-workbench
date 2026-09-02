@@ -37,6 +37,7 @@ class EvalCitation(BaseModel):
 
 class EvalGroundTruthClip(BaseModel):
     requirement_id: str
+    source_asset_id: Optional[str] = None
     source_start: float = Field(ge=0)
     source_end: float = Field(gt=0)
     evidence_ids: list[str] = Field(min_length=1)
@@ -45,6 +46,25 @@ class EvalGroundTruthClip(BaseModel):
     def validate_range(self):
         if self.source_end <= self.source_start:
             raise ValueError("标注片段结束时间必须晚于开始时间")
+        return self
+
+
+class EvalPredictedClip(BaseModel):
+    """对最终候选/计划的人工标注结果，不依赖模型自报质量分。"""
+
+    source_asset_id: Optional[str] = None
+    source_start: float = Field(ge=0)
+    source_end: float = Field(gt=0)
+    requirement_ids: list[str] = Field(default_factory=list)
+    text: str = ""
+    complete_expression: bool
+    retains_required_context: bool = True
+    structure_stage: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.source_end <= self.source_start:
+            raise ValueError("预测片段结束时间必须晚于开始时间")
         return self
 
 
@@ -58,6 +78,10 @@ class EvalTask(BaseModel):
     citations: list[EvalCitation] = Field(default_factory=list)
     candidate_count: int = Field(default=0, ge=0)
     modified_candidate_count: int = Field(default=0, ge=0)
+    target_duration: Optional[float] = Field(default=None, gt=0)
+    predicted_clips: list[EvalPredictedClip] = Field(default_factory=list)
+    expected_structure_stages: list[str] = Field(default_factory=list)
+    duration_gap_explained: Optional[bool] = None
 
     @model_validator(mode="after")
     def validate_annotations(self):
@@ -165,10 +189,113 @@ class OfflineEvaluationRunner:
             "ablations": ablations,
             "degradation": degradation,
             **citation_report,
+            "editing_quality": self._evaluate_editing_quality(dataset),
             "human_modification_rate": (
                 total_modified / total_candidates if total_candidates else 0.0
             ),
         }
+
+    @staticmethod
+    def _evaluate_editing_quality(dataset: EvalDataset) -> dict:
+        """评估完整表达、时长、多样性、结构覆盖和跨素材来源追溯。"""
+        measured = [task for task in dataset.tasks if task.predicted_clips]
+        clips = [clip for task in measured for clip in task.predicted_clips]
+        if not clips:
+            return {
+                "measured_task_count": 0,
+                "complete_expression_rate": None,
+                "required_context_retention_rate": None,
+                "mean_duration_error_seconds": None,
+                "duplicate_clip_rate": None,
+                "structure_coverage_rate": None,
+                "source_trace_accuracy": None,
+                "requirement_coverage_rate": None,
+                "duration_gap_explanation_rate": None,
+            }
+
+        duration_errors = []
+        structure_scores = []
+        requirement_scores = []
+        explained = []
+        duplicate_count = 0
+        comparison_count = 0
+        trace_valid = 0
+        for task in measured:
+            task_duration = sum(
+                clip.source_end - clip.source_start for clip in task.predicted_clips
+            )
+            if task.target_duration is not None:
+                duration_errors.append(abs(task_duration - task.target_duration))
+            expected_stages = set(task.expected_structure_stages)
+            if expected_stages:
+                observed = {
+                    clip.structure_stage for clip in task.predicted_clips
+                    if clip.structure_stage
+                }
+                structure_scores.append(len(expected_stages & observed) / len(expected_stages))
+            required = {query.requirement.id for query in task.queries}
+            covered = {
+                requirement_id
+                for clip in task.predicted_clips
+                for requirement_id in clip.requirement_ids
+            }
+            requirement_scores.append(len(required & covered) / len(required) if required else 1.0)
+            if task.duration_gap_explained is not None:
+                explained.append(float(task.duration_gap_explained))
+            evidence_source_ids = {
+                item.source_asset_id for item in task.evidence if item.source_asset_id
+            }
+            for clip in task.predicted_clips:
+                if clip.source_asset_id and clip.source_asset_id in evidence_source_ids:
+                    trace_valid += 1
+            for index, left in enumerate(task.predicted_clips):
+                for right in task.predicted_clips[index + 1:]:
+                    comparison_count += 1
+                    if OfflineEvaluationRunner._clips_duplicate(left, right):
+                        duplicate_count += 1
+        return {
+            "measured_task_count": len(measured),
+            "complete_expression_rate": statistics.fmean(
+                float(clip.complete_expression) for clip in clips
+            ),
+            "required_context_retention_rate": statistics.fmean(
+                float(clip.retains_required_context) for clip in clips
+            ),
+            "mean_duration_error_seconds": (
+                statistics.fmean(duration_errors) if duration_errors else None
+            ),
+            "duplicate_clip_rate": (
+                duplicate_count / comparison_count if comparison_count else 0.0
+            ),
+            "structure_coverage_rate": (
+                statistics.fmean(structure_scores) if structure_scores else None
+            ),
+            "source_trace_accuracy": trace_valid / len(clips),
+            "requirement_coverage_rate": statistics.fmean(requirement_scores),
+            "duration_gap_explanation_rate": (
+                statistics.fmean(explained) if explained else None
+            ),
+        }
+
+    @staticmethod
+    def _clips_duplicate(left: EvalPredictedClip, right: EvalPredictedClip) -> bool:
+        if left.source_asset_id != right.source_asset_id:
+            return False
+        overlap = max(
+            0.0,
+            min(left.source_end, right.source_end)
+            - max(left.source_start, right.source_start),
+        )
+        shorter = min(
+            left.source_end - left.source_start,
+            right.source_end - right.source_start,
+        )
+        if shorter and overlap / shorter >= 0.8:
+            return True
+        left_chars = set("".join(left.text.lower().split()))
+        right_chars = set("".join(right.text.lower().split()))
+        union = left_chars | right_chars
+        return bool(union) and len(left_chars & right_chars) / len(union) >= 0.85
 
     def run_to_file(self, dataset_path: Path, output_path: Path, top_k: int = 3) -> dict:
         report = self.run(self.load_dataset(dataset_path), top_k=top_k)
@@ -248,6 +375,7 @@ class OfflineEvaluationRunner:
                     rejected_hallucinations += 1
                     continue
                 candidate = CandidateClip(
+                    source_asset_id=evidence.source_asset_id,
                     source_start=evidence.source_start,
                     source_end=evidence.source_end,
                     matched_requirement_ids=[raw.requirement_id],

@@ -6,90 +6,114 @@
       "scenario": "school",
       "raw_requirement": "运动会回顾必须包含开幕式，给师生和家长观看。",
       "evidence": [
-        {"id": "s1e1", "source_start": 10, "source_end": 16, "content": "校长宣布本届运动会正式开幕", "content_hash": "s1e1"},
-        {"id": "s1e2", "source_start": 40, "source_end": 46, "content": "运动员正在检录准备比赛", "content_hash": "s1e2"},
-        {"id": "s1e3", "source_start": 90, "source_end": 96, "content": "观众为运动员加油欢呼", "content_hash": "s1e3"}
+        {"id": "s1e1", "source_asset_id": "school-source-1", "source_start": 10, "source_end": 16, "content": "校长宣布本届运动会正式开幕", "content_hash": "s1e1"},
+        {"id": "s1e2", "source_asset_id": "school-source-1", "source_start": 40, "source_end": 46, "content": "运动员正在检录准备比赛", "content_hash": "s1e2"},
+        {"id": "s1e3", "source_asset_id": "school-source-1", "source_start": 90, "source_end": 96, "content": "观众为运动员加油欢呼", "content_hash": "s1e3"}
       ],
       "queries": [{"requirement": {"id": "s1r1", "description": "必须包含开幕式", "priority": "must", "acceptance_rule": "成片包含开幕证据"}, "query": "运动会开幕式", "relevant_evidence_ids": ["s1e1"]}],
       "ground_truth_clips": [{"requirement_id": "s1r1", "source_start": 10, "source_end": 16, "evidence_ids": ["s1e1"]}],
       "citations": [{"requirement_id": "s1r1", "evidence_id": "s1e1", "quote": "正式开幕"}],
       "candidate_count": 3,
-      "modified_candidate_count": 1
+      "modified_candidate_count": 1,
+      "target_duration": 6,
+      "expected_structure_stages": ["opening"],
+      "duration_gap_explained": true,
+      "predicted_clips": [{"source_asset_id": "school-source-1", "source_start": 10, "source_end": 16, "requirement_ids": ["s1r1"], "text": "校长宣布本届运动会正式开幕", "complete_expression": true, "retains_required_context": true, "structure_stage": "opening"}]
     },
     {
       "id": "school-award",
       "scenario": "school",
       "raw_requirement": "剪出一等奖颁奖片段，奖项名称必须准确。",
       "evidence": [
-        {"id": "s2e1", "source_start": 12, "source_end": 18, "content": "下面颁发男子一百米一等奖", "content_hash": "s2e1"},
-        {"id": "s2e2", "source_start": 35, "source_end": 41, "content": "同学们回到各自班级", "content_hash": "s2e2"},
-        {"id": "s2e3", "source_start": 60, "source_end": 66, "content": "裁判介绍比赛注意事项", "content_hash": "s2e3"}
+        {"id": "s2e1", "source_asset_id": "school-source-2", "source_start": 12, "source_end": 18, "content": "下面颁发男子一百米一等奖", "content_hash": "s2e1"},
+        {"id": "s2e2", "source_asset_id": "school-source-2", "source_start": 35, "source_end": 41, "content": "同学们回到各自班级", "content_hash": "s2e2"},
+        {"id": "s2e3", "source_asset_id": "school-source-2", "source_start": 60, "source_end": 66, "content": "裁判介绍比赛注意事项", "content_hash": "s2e3"}
       ],
       "queries": [{"requirement": {"id": "s2r1", "description": "必须包含一等奖颁奖", "priority": "must", "acceptance_rule": "引用一等奖颁奖原文"}, "query": "一等奖颁奖", "relevant_evidence_ids": ["s2e1"]}],
       "ground_truth_clips": [{"requirement_id": "s2r1", "source_start": 12, "source_end": 18, "evidence_ids": ["s2e1"]}],
       "citations": [{"requirement_id": "s2r1", "evidence_id": "s2e1", "quote": "颁发男子一百米一等奖"}, {"requirement_id": "s2r1", "evidence_id": "s2e1", "quote": "颁发男子一百米二等奖"}],
       "candidate_count": 4,
-      "modified_candidate_count": 1
+      "modified_candidate_count": 1,
+      "target_duration": 6,
+      "expected_structure_stages": ["climax"],
+      "duration_gap_explained": true,
+      "predicted_clips": [{"source_asset_id": "school-source-2", "source_start": 12, "source_end": 18, "requirement_ids": ["s2r1"], "text": "下面颁发男子一百米一等奖", "complete_expression": true, "retains_required_context": true, "structure_stage": "climax"}]
     },
     {
       "id": "school-performance",
       "scenario": "school",
       "raw_requirement": "校园艺术节回顾必须保留学生合唱节目。",
       "evidence": [
-        {"id": "s3e1", "source_start": 5, "source_end": 11, "content": "初一年级带来大合唱明天会更好", "content_hash": "s3e1"},
-        {"id": "s3e2", "source_start": 24, "source_end": 30, "content": "主持人介绍下一位嘉宾", "content_hash": "s3e2"},
-        {"id": "s3e3", "source_start": 50, "source_end": 56, "content": "舞台灯光已经准备完毕", "content_hash": "s3e3"}
+        {"id": "s3e1", "source_asset_id": "school-source-3", "source_start": 5, "source_end": 11, "content": "初一年级带来大合唱明天会更好", "content_hash": "s3e1"},
+        {"id": "s3e2", "source_asset_id": "school-source-3", "source_start": 24, "source_end": 30, "content": "主持人介绍下一位嘉宾", "content_hash": "s3e2"},
+        {"id": "s3e3", "source_asset_id": "school-source-3", "source_start": 50, "source_end": 56, "content": "舞台灯光已经准备完毕", "content_hash": "s3e3"}
       ],
       "queries": [{"requirement": {"id": "s3r1", "description": "必须包含学生合唱表演", "priority": "must", "acceptance_rule": "成片有合唱证据"}, "query": "学生合唱节目", "relevant_evidence_ids": ["s3e1"]}],
       "ground_truth_clips": [{"requirement_id": "s3r1", "source_start": 5, "source_end": 11, "evidence_ids": ["s3e1"]}],
       "citations": [{"requirement_id": "s3r1", "evidence_id": "s3e1", "quote": "带来大合唱"}],
       "candidate_count": 3,
-      "modified_candidate_count": 0
+      "modified_candidate_count": 0,
+      "target_duration": 6,
+      "expected_structure_stages": ["body"],
+      "duration_gap_explained": true,
+      "predicted_clips": [{"source_asset_id": "school-source-3", "source_start": 5, "source_end": 11, "requirement_ids": ["s3r1"], "text": "初一年级带来大合唱明天会更好", "complete_expression": true, "retains_required_context": true, "structure_stage": "body"}]
     },
     {
       "id": "enterprise-product-launch",
       "scenario": "enterprise",
       "raw_requirement": "产品发布会回顾必须包含新产品正式亮相。",
       "evidence": [
-        {"id": "e1e1", "source_start": 15, "source_end": 22, "content": "全新云端协作产品今天正式发布", "content_hash": "e1e1"},
-        {"id": "e1e2", "source_start": 44, "source_end": 50, "content": "来宾正在会场签到", "content_hash": "e1e2"},
-        {"id": "e1e3", "source_start": 78, "source_end": 84, "content": "主持人感谢媒体朋友到场", "content_hash": "e1e3"}
+        {"id": "e1e1", "source_asset_id": "enterprise-source-1", "source_start": 15, "source_end": 22, "content": "全新云端协作产品今天正式发布", "content_hash": "e1e1"},
+        {"id": "e1e2", "source_asset_id": "enterprise-source-1", "source_start": 44, "source_end": 50, "content": "来宾正在会场签到", "content_hash": "e1e2"},
+        {"id": "e1e3", "source_asset_id": "enterprise-source-1", "source_start": 78, "source_end": 84, "content": "主持人感谢媒体朋友到场", "content_hash": "e1e3"}
       ],
       "queries": [{"requirement": {"id": "e1r1", "description": "必须包含产品正式亮相", "priority": "must", "acceptance_rule": "成片有产品发布证据"}, "query": "新产品亮相发布", "relevant_evidence_ids": ["e1e1"]}],
       "ground_truth_clips": [{"requirement_id": "e1r1", "source_start": 15, "source_end": 22, "evidence_ids": ["e1e1"]}],
       "citations": [{"requirement_id": "e1r1", "evidence_id": "e1e1", "quote": "产品今天正式发布"}],
       "candidate_count": 5,
-      "modified_candidate_count": 1
+      "modified_candidate_count": 1,
+      "target_duration": 7,
+      "expected_structure_stages": ["climax"],
+      "duration_gap_explained": true,
+      "predicted_clips": [{"source_asset_id": "enterprise-source-1", "source_start": 15, "source_end": 22, "requirement_ids": ["e1r1"], "text": "全新云端协作产品今天正式发布", "complete_expression": true, "retains_required_context": true, "structure_stage": "climax"}]
     },
     {
       "id": "enterprise-signing",
       "scenario": "enterprise",
       "raw_requirement": "合作活动回顾必须保留双方代表签约。",
       "evidence": [
-        {"id": "e2e1", "source_start": 20, "source_end": 27, "content": "双方代表共同签署战略合作协议", "content_hash": "e2e1"},
-        {"id": "e2e2", "source_start": 55, "source_end": 61, "content": "工作人员调整现场座位", "content_hash": "e2e2"},
-        {"id": "e2e3", "source_start": 80, "source_end": 86, "content": "茶歇将在十五分钟后开始", "content_hash": "e2e3"}
+        {"id": "e2e1", "source_asset_id": "enterprise-source-2", "source_start": 20, "source_end": 27, "content": "双方代表共同签署战略合作协议", "content_hash": "e2e1"},
+        {"id": "e2e2", "source_asset_id": "enterprise-source-2", "source_start": 55, "source_end": 61, "content": "工作人员调整现场座位", "content_hash": "e2e2"},
+        {"id": "e2e3", "source_asset_id": "enterprise-source-2", "source_start": 80, "source_end": 86, "content": "茶歇将在十五分钟后开始", "content_hash": "e2e3"}
       ],
       "queries": [{"requirement": {"id": "e2r1", "description": "必须包含合作签约环节", "priority": "must", "acceptance_rule": "成片包含签署协议证据"}, "query": "合作伙伴签约", "relevant_evidence_ids": ["e2e1"]}],
       "ground_truth_clips": [{"requirement_id": "e2r1", "source_start": 20, "source_end": 27, "evidence_ids": ["e2e1"]}],
       "citations": [{"requirement_id": "e2r1", "evidence_id": "e2e1", "quote": "签署战略合作协议"}],
       "candidate_count": 4,
-      "modified_candidate_count": 2
+      "modified_candidate_count": 2,
+      "target_duration": 7,
+      "expected_structure_stages": ["body"],
+      "duration_gap_explained": true,
+      "predicted_clips": [{"source_asset_id": "enterprise-source-2", "source_start": 20, "source_end": 27, "requirement_ids": ["e2r1"], "text": "双方代表共同签署战略合作协议", "complete_expression": true, "retains_required_context": true, "structure_stage": "body"}]
     },
     {
       "id": "enterprise-ceo-summary",
       "scenario": "enterprise",
       "raw_requirement": "年会总结视频必须包含 CEO 对下一步工作的总结。",
       "evidence": [
-        {"id": "e3e1", "source_start": 8, "source_end": 15, "content": "首席执行官总结明年的三项重点工作", "content_hash": "e3e1"},
-        {"id": "e3e2", "source_start": 32, "source_end": 38, "content": "市场负责人介绍会场安排", "content_hash": "e3e2"},
-        {"id": "e3e3", "source_start": 70, "source_end": 76, "content": "全体员工合影留念", "content_hash": "e3e3"}
+        {"id": "e3e1", "source_asset_id": "enterprise-source-3", "source_start": 8, "source_end": 15, "content": "首席执行官总结明年的三项重点工作", "content_hash": "e3e1"},
+        {"id": "e3e2", "source_asset_id": "enterprise-source-3", "source_start": 32, "source_end": 38, "content": "市场负责人介绍会场安排", "content_hash": "e3e2"},
+        {"id": "e3e3", "source_asset_id": "enterprise-source-3", "source_start": 70, "source_end": 76, "content": "全体员工合影留念", "content_hash": "e3e3"}
       ],
       "queries": [{"requirement": {"id": "e3r1", "description": "必须包含 CEO 核心总结", "priority": "must", "acceptance_rule": "成片包含负责人总结证据"}, "query": "CEO 总结下一步重点", "relevant_evidence_ids": ["e3e1"]}],
       "ground_truth_clips": [{"requirement_id": "e3r1", "source_start": 8, "source_end": 15, "evidence_ids": ["e3e1"]}],
       "citations": [{"requirement_id": "e3r1", "evidence_id": "e3e1", "quote": "总结明年的三项重点工作"}],
       "candidate_count": 3,
-      "modified_candidate_count": 1
+      "modified_candidate_count": 1,
+      "target_duration": 7,
+      "expected_structure_stages": ["closing"],
+      "duration_gap_explained": true,
+      "predicted_clips": [{"source_asset_id": "enterprise-source-3", "source_start": 8, "source_end": 15, "requirement_ids": ["e3r1"], "text": "首席执行官总结明年的三项重点工作", "complete_expression": true, "retains_required_context": true, "structure_stage": "closing"}]
     }
   ]
 }
