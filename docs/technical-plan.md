@@ -183,7 +183,7 @@ class RequirementSpec(BaseModel):
 
 规则：
 
-- 独立 `RequirementClarificationAgent` 单次最多返回 3 个澄清问题，也可以返回空数组。
+- 转录后的 `MaterialInterviewAgent` 由 Harness 先检索证据，再用一次结构化调用返回最多 5 个问题，也可以返回空数组；MVP 不运行无上限的 Agent 工具循环。
 - `confirmed` 版本不可原地修改；修改必须生成新版本。
 - `must` 和 `prohibited` 项必须具有可执行的验收规则或明确标记人工验收。
 
@@ -222,7 +222,7 @@ class ClarificationTurn(BaseModel):
     created_at: datetime
 ```
 
-`RequirementCompiler` 先生成任务书草稿和槽位快照；`RequirementClarificationAgent` 再读取原始需求、当前任务书和 Harness 提供的允许槽位，输出最多 3 个 `ClarificationQuestion`。模型不能创建任意槽位或直接写入任务书，未知槽位、重复问题、已确认槽位和非法结构由代码丢弃。`RequirementClarificationService` 只把用户回答作为槽位补丁合并，并保护 `confirmed` 值不被静默覆盖。用户选择忽略时记录为 `unknown`，不生成虚假需求事实。
+`RequirementCompiler` 只从用户原文和表单提取明确值，生成不臆测的任务书骨架与槽位快照。完成转录后，Harness 先检索相关证据，`MaterialInterviewAgent` 一次输出最多 5 个问题。模型不能创建任意事实或直接写入任务书；未知证据、重复问题和非法结构由代码丢弃。`RequirementClarificationService` 在用户最终统一确认时把所有回答作为槽位补丁合并，并保护 `confirmed` 值不被静默覆盖；忽略项记录为 `unknown`。
 
 ### 4.2.2 ExecutionBrief：用户可见的执行说明
 
@@ -591,14 +591,14 @@ class TaskEventRecord(BaseModel):
 
 避免使用一条超级 Prompt：
 
-1. `raw_text + 场景规则 → RequirementSlot[] + RequirementSpec draft`。
-2. 本地 Whisper 生成 `material_analysis.json`、转录和证据窗口；`RequirementAlignmentAgent` 比较素材与初步任务书。
-3. 若结果为 `too_vague` 或 `mismatch`，用户选择采用、修改后采用或保持原任务书；决定生成新版本和审计事件，模型建议不能直接越过该操作。
-4. `RequirementClarificationAgent` 根据决定后的任务书，从 Harness 允许的槽位中动态生成 0–3 个带原因和影响说明的问题。
-5. 每轮 `用户回答/忽略 → 槽位补丁 → 确定性合并 → 新任务书草稿`，已确认值不被模型静默覆盖。
-6. 用户编辑任务书、解决所有阻塞槽位并批准需求版本。
-7. 候选阶段复用预分析转录，执行 `search_evidence` / `expand_evidence` → 受限证据集 → `CandidateClip[]`，不得重复运行 Whisper。
-8. `EvidenceValidator`、Schema 与领域规则校验后创建下一阶段版本化输入；风格推荐只能从 `StyleCatalog` 选择已有 ID。
+1. 代码从 `raw_text + 表单显式值` 建立不臆测的 `RequirementSlot[] + RequirementSpec draft`；未提供的用途、受众、风格和音乐保持待确认，不调用 LLM 补常识。
+2. 本地 Whisper 分别生成每段素材的转录和证据窗口；相同素材按内容哈希和 Whisper 模型复用缓存。
+3. 代码先检索紧凑证据，`MaterialInterviewAgent` 一次生成 0–5 个带原因和影响说明的问题，不进行多轮工具循环。
+4. 素材摘要、AI 问题、用途、受众、目标时长、风格、字幕、音乐和内容要求在同一页面展示；每题可补充或忽略，不单独提交。
+5. 用户统一点击确认后，Harness 一次保存答案和字段修改、生成新任务书版本并批准当前需求 Gate。
+6. 候选阶段复用转录和共享 Embedding 矩阵；代码为全部要求检索后，只调用一次 LLM 批量排序和解释。
+7. 确定性代码补齐引文、来源、时间和需求关联，并按时长预算增加可验证的检索候选；用户在同一方案页审核。
+8. `EvidenceValidator`、Schema 与领域规则校验后创建下一阶段版本化输入；片头、片尾、字幕和转场只能从 `StyleCatalog` 的稳定 ID 选择。
 
 ### 6.2 场景知识包
 
@@ -626,8 +626,8 @@ DOMAIN_CONFIG = {
 - Pydantic 校验所有模型输出。
 - 未知优先级、非法时长或重复 ID 直接拒绝。
 - 模型不得将未经用户确认的人名和职务标为已确认。
-- 模型调用失败时保留用户原始需求并进入人工编辑，不静默生成默认正式需求。
-- 人工降级草稿必须标记 `RequirementCompilation.mode = manual_required`，显示失败警告并把降级模式写入任务清单与业务审计；用户可直接编辑草稿后批准 Gate。澄清 Agent 失败时单独记录 `ai_failed`，不得回退到伪装成 AI 的固定问题。
+- 快速模式的需求骨架标记为 `material_assisted`：只采用原文和表单显式值，不把模型猜测写成用户事实。旧兼容接口真正调用失败时仍可使用 `manual_required`。
+- 素材访谈 Agent 失败时单独记录 `ai_failed`，不得回退到伪装成 AI 的固定问题；用户仍可直接编辑同页任务书。
 - 将转录、用户需求和工具返回结果作为不可信数据包，用明确分隔符传入模型；它们不能覆盖系统指令或工具权限。
 - 每次调用记录模型、提示模板版本、工具调用参数、检索证据 ID、耗时、token 和结构化错误；不记录隐藏推理。
 
@@ -657,19 +657,23 @@ MVP 优先使用本地 BM25、FAISS/NumPy 和 RRF。`EvidenceIndex` 定义 `inde
 
 `EvidenceReranker` 可采用 Cross-Encoder 或受限 LLM，对需求相关性、信息完整度和确认状态二次排序；音画质量、重复度和风险由 `CandidateReranker` 在片段层处理。重排只改变候选顺序，不绕过 `must` 覆盖规则或人工 Gate。Rerank 不可用或超时时降级到 RRF，并写入可观测事件而不是静默伪装为完整链路。
 
-### 7.3 受限工具调用与引用校验
+### 7.3 批量排序与引用校验
 
-1. 候选模型不能收到全文转录，也不能一次处理整份任务书。Harness 对每条可选内容要求建立独立批次；该批次的 `search_evidence(requirement_id, query, top_k)` 只接受当前需求 ID，并可调用 `expand_evidence(evidence_id)` 请求已召回证据的相邻上下文。
-2. 每批最多返回 2 个紧凑选择：`evidence_id`、`source_start`、`source_end`、简短 `reason` 和 `confidence`。单批输出预算固定为 1000 tokens，禁止模型返回引文、需求 ID、检索分数或字幕全文，从结构上避免整份候选 JSON 撞到模型输出上限。
-3. Harness 根据当前批次和证据索引确定性生成 `EvidenceCitation(requirement_id, evidence_id, quote, relation, retrieval_score)`；即使模型额外输出同名字段也一律忽略，因此引文和需求关联不是可伪造的自由字段。
-4. 单批失败最多重试 1 次；仍失败时只把该项检索建议标记为不可导出的降级候选，其他成功批次继续进入审核。任务产物记录 `failed_requirement_ids`，页面用用户可读的需求描述提示局部失败。
-5. 代码先把模型时间吸附到完整 ASR 段边界，并向前后补齐明显的连接词、因果关系和同一说话人承接句；随后合并跨需求重复候选，同时保留每项需求的独立引用。
+1. 候选模型不接收全文转录。Harness 先为全部内容要求执行混合检索，保留最多 60 个备用证据窗口，只将前 18 个紧凑窗口一次性传入排序器。模型输入上限与本地备用池上限分离，避免为限制输出 Token 而限制可用成片时长。
+2. 排序器单次只返回 `evidence_id`、`requirement_ids`、简短 `reason` 和 `confidence`，输出预算固定为 1400 tokens；禁止重复字幕全文和检索分数，从结构上避免输出上限问题。
+3. Harness 根据受限证据索引确定性生成 `EvidenceCitation(requirement_id, evidence_id, quote, relation, retrieval_score)`；模型额外返回的引文、时间或分数字段一律忽略。
+4. 模型失败、返回空列表或所选总时长不足时，Harness 从已经记录来源、时间和原文的检索池补足候选，并标记 `code_retrieved_review_required`。这些是可审核建议，不冒充 AI 高光，也不因模型故障禁止整份方案出片。
+5. 代码把候选吸附到完整 ASR 段边界，并向前后补齐明显的连接词、因果关系和问答上下文；剩余边界启发式异常作为风险提示，不再单独构成硬删除条件。
 6. `EvidenceValidator` 对代码生成的引文和证据执行 Unicode NFKC 归一化，并忽略空白与受控标点差异，然后要求剩余引用仍是证据原文的连续子串；人名、职务、奖项和产品实体的字符不得模糊通过。
-7. 验证需求 ID、证据 ID、当前批准范围、候选源时间、证据时间和素材边界。任何失败均不得参与自动选段。语义相关性来自召回、重排和受限 LLM，只是建议；确定性代码不声称证明两个不同表述语义等价。
+7. 未知来源、素材越界、未知证据、证据不在候选范围或引文被篡改仍是硬错误，不得进入时间线。语义相关性和完整表达评分只是建议，不伪装成确定性证明。
 
 该规则与 PRD 保持一致，明确取消“编辑距离 5% 即自动通过”的宽松方案，避免短中文实体只差一个字时产生错误引用。
 
 ### 7.4 候选规划
+
+不能在候选时长简单相加达到目标后停止召回。ScriptAgent 从包含备用片段的候选池中选择不重叠区间，按目标时长而非最低容差努力补足，并预先扣除默认转场重叠；最终计划生成后再覆盖写入 `duration_budget.json`，该报告与时间线必须一致。审核区提供无需模型调用的 `supplement_plan_duration`：保留已审片段及字幕/顺序修改，排除用户已删除范围，再从已保存转录中补选，并以 `auto_add` 决策和新计划版本记录；不会直接渲染。
+
+候选边界通过限于原候选前后 5 秒的双滑块修改，预览同步定位并显示附近原话；播放器当前画面也可直接设为开头/结尾。界面不再要求用户凭记忆填写秒数。
 
 去重、重叠、最短片段、`must` 覆盖和总时长由确定性代码处理；`must` 内容不因普通预算算法静默删除。用户在电脑端审核候选、证据、风险和粗剪时间线，可保留、删除、缩短、延长、替换、排序或手动添加片段；批准集合后才渲染。现有关键词加权只作为一路召回，不再作为需求覆盖、最终排序或候选理由的唯一依据。
 
@@ -689,9 +693,11 @@ class ToolPolicy(BaseModel):
     max_calls_per_run: int
 ```
 
-MVP2 暴露给模型的工具只有 `search_evidence` 和 `expand_evidence`；`get_media_info` 与确定性校验属于 Harness 内部服务操作，不进入模型工具列表。后续可增加 `search_event_documents`、`extract_keyframes`、`ocr_frames`、`check_visual_quality` 和 `preview_clip`。`render_video`、处理交付例外和修改正式状态属于有副作用操作，必须由业务服务在有效 Gate 下调用，不能仅因模型发起 Function Calling 就执行。工具错误返回稳定错误码，并记录 trace、耗时和降级结果。
+快速模式不让候选排序模型循环调用工具：检索、相邻上下文扩展、媒体信息和确定性校验都由 Harness 先完成，再一次性提供紧凑证据。后续视觉理解可增加 `extract_keyframes`、`ocr_frames`、`check_visual_quality` 和 `preview_clip` 等受限工具，但 `render_video`、处理交付例外和修改正式状态始终由业务服务在有效 Gate 下调用。
 
 ## 8. 审核与访问范围
+
+默认快速路径的性能预算：需求前不调用 LLM；转录后素材访谈 1 次、候选批量排序 1 次，可选语义检查不超过 2 次，因此常规任务控制在 2–4 次 LLM 调用。5 分钟素材的首个可审核方案目标为 3–5 分钟，人工审核 3–5 分钟，基础渲染 1–3 分钟；候选预览点击时生成，不计入首屏阻塞时间。
 
 ### 8.1 电脑端
 
@@ -699,7 +705,7 @@ MVP2 暴露给模型的工具只有 `search_evidence` 和 `expand_evidence`；`g
 - 每个阶段显示当前输入版本、系统/AI 建议、证据、风险、可操作项和下一阶段门禁状态。
 - 候选列表、预览、证据和风险展示。
 - 可查看当前 `ExecutionBrief`；用户编辑任务书后由确定性代码重新生成执行说明，避免直接编辑执行视图造成任务书与模型输入不一致。
-- 以卡片或短预览展示最多 3 组风格建议；用户可选择整组风格或逐项替换片头、片尾、字幕和默认转场。
+- 用同一任务书表单确认整体风格、字幕和音乐；片头、片尾、字幕外观、音量和默认转场折叠为高级设置。
 - 可查看全局交付规则以及逐段源时间、成片时间、标题卡、字幕和转场。
 - 用户选择、字幕修正和计划汇总。
 - 渲染与验收报告。

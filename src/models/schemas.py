@@ -20,10 +20,9 @@ Python 知识点：
   3. Optional[str] — 可选字段，可以不给值（默认为 None）
   4. from __future__ import annotations — 让类型提示更好用
 
-面试会问：
-  为什么不用 dataclass 而用 Pydantic？
-  → Pydantic 支持自动校验、JSON序列化、嵌套模型，
-    还能把 schema 转成 JSON Schema 给 LLM 的 function calling 用。
+模型选型：
+  Pydantic 提供自动校验、JSON 序列化和嵌套模型支持，
+  并可导出 JSON Schema，约束 LLM 结构化输出和工具调用参数。
 ===========================================================================
 """
 
@@ -178,7 +177,7 @@ class RequirementCompilation(BaseModel):
     spec: RequirementSpec
     execution_brief: ExecutionBrief
     legacy_requirement: VideoRequirement
-    mode: Literal["llm_generated", "manual_required"] = "llm_generated"
+    mode: Literal["llm_generated", "manual_required", "material_assisted"] = "material_assisted"
     warnings: list[str] = Field(default_factory=list)
     slots: list["RequirementSlot"] = Field(default_factory=list)
     alignment_proposal: Optional["MaterialAlignmentProposal"] = None
@@ -1035,7 +1034,7 @@ class CandidateDecision(BaseModel):
     candidate_id: str
     action: Literal[
         "keep", "delete", "trim", "replace", "reorder",
-        "subtitle_edit", "title_edit", "manual_add",
+        "subtitle_edit", "title_edit", "manual_add", "auto_add",
     ]
     before: Dict[str, Any] = Field(default_factory=dict)
     after: Dict[str, Any] = Field(default_factory=dict)

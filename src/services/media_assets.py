@@ -21,6 +21,29 @@ from src.tools.ffmpeg import FFmpegTool
 class MediaAssetService:
     """原素材不拼接；所有事实先落在 ``source_asset_id + local_time`` 上。"""
 
+    def __init__(
+        self,
+        cache_root: Path | None = None,
+        cache_namespace: str = "default",
+    ):
+        self.cache_root = Path(cache_root) if cache_root else None
+        self.cache_namespace = cache_namespace
+
+    def _cached_analysis(self, source: SourceAsset) -> ContentAnalysis | None:
+        if not self.cache_root:
+            return None
+        cache_dir = self.cache_root / self.cache_namespace / source.id
+        try:
+            return TaskStore(cache_dir).read_model("analysis.json", ContentAnalysis)
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+
+    def _save_cached_analysis(self, source: SourceAsset, analysis: ContentAnalysis) -> None:
+        if not self.cache_root:
+            return
+        cache_dir = self.cache_root / self.cache_namespace / source.id
+        TaskStore(cache_dir).write_model("analysis.json", analysis)
+
     def register(
         self,
         task_id: str,
@@ -71,6 +94,7 @@ class MediaAssetService:
         store: TaskStore,
         *,
         run_in_context: Callable[[SourceAsset], ContentAnalysis] | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
     ) -> tuple[TaskMaterialSet, ContentAnalysis]:
         """逐素材分析并持久化；单个素材失败只产生局部失败记录。"""
         results: list[SourceAnalysisResult] = []
@@ -78,7 +102,13 @@ class MediaAssetService:
             update={"status": "analyzing", "updated_at": utc_now()}
         )
         store.write_model("material_set.json", analyzing)
-        for source in analyzing.sources:
+        source_count = len(analyzing.sources)
+        for source_index, source in enumerate(analyzing.sources, start=1):
+            if progress_callback:
+                progress_callback(
+                    (source_index - 1) / max(1, source_count),
+                    f"正在处理第 {source_index}/{source_count} 段：{source.filename}",
+                )
             source_store = TaskStore(store.task_dir / "sources" / source.id)
             source_store.write_model("source_manifest.json", source)
             if not source.has_audio:
@@ -96,7 +126,11 @@ class MediaAssetService:
             transcribing = source.model_copy(update={"analysis_state": "transcribing"})
             source_store.write_model("source_manifest.json", transcribing)
             try:
-                if run_in_context is not None:
+                analysis = self._cached_analysis(source)
+                cache_hit = analysis is not None
+                if analysis is not None:
+                    pass
+                elif run_in_context is not None:
                     analysis = run_in_context(source)
                 else:
                     analysis = analysis_agent.run(
@@ -104,12 +138,15 @@ class MediaAssetService:
                         requirement,
                         source_asset_id=source.id,
                     )
+                if not cache_hit:
+                    self._save_cached_analysis(source, analysis)
                 ready = source.model_copy(update={"analysis_state": "ready"})
                 result = SourceAnalysisResult(
                     source=ready,
                     analysis=analysis,
                     status="ready",
-                    attempt_count=1,
+                    attempt_count=0 if cache_hit else 1,
+                    warnings=["已复用相同素材的转录缓存"] if cache_hit else [],
                     completed_at=utc_now(),
                 )
                 source_store.write_model("source_manifest.json", ready)
@@ -141,6 +178,11 @@ class MediaAssetService:
                 source_store.write_model("source_manifest.json", failed)
             results.append(result)
             source_store.write_model("analysis_result.json", result)
+            if progress_callback:
+                progress_callback(
+                    source_index / max(1, source_count),
+                    f"已完成第 {source_index}/{source_count} 段：{source.filename}",
+                )
 
         ready_count = sum(item.status == "ready" for item in results)
         failed_count = sum(item.status == "failed" for item in results)

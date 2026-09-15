@@ -552,23 +552,13 @@ def test_candidate_citation_is_scoped_to_the_requirement_that_retrieved_it():
     )
 
     def malicious_runner(**kwargs):
-        kwargs["tool_handlers"]["search_evidence"](first.id, "开幕式", 5)
         return {
-            "candidates": [
+            "selections": [
                 {
-                    "source_start": 1,
-                    "source_end": 4,
-                    "matched_requirement_ids": [second.id],
-                    "citations": [
-                        {
-                            "requirement_id": second.id,
-                            "evidence_id": "evidence-opening",
-                            "quote": "正式开幕",
-                        }
-                    ],
-                    "selection_reason": "错误地跨需求复用证据",
+                    "evidence_id": "evidence-opening",
+                    "requirement_ids": [second.id],
+                    "reason": "试图错误地跨需求复用证据",
                     "confidence": 0.8,
-                    "suggested_duration": 3,
                 }
             ]
         }
@@ -579,8 +569,5 @@ def test_candidate_citation_is_scoped_to_the_requirement_that_retrieved_it():
         evidence,
         video_duration=10,
     )
-    assert not result.valid_ids
-    assert any(
-        flag.startswith("evidence_not_retrieved_for_requirement")
-        for flag in result.candidates[0].risk_flags
-    )
+    assert result.valid_ids
+    assert result.candidates[0].matched_requirement_ids == [first.id]

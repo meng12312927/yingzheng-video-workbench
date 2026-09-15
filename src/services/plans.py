@@ -171,6 +171,28 @@ class EditPlanService:
                     )
                 )
             segments.append(revised)
+        existing_ids = {item.candidate_id for item in plan.timeline_segments}
+        additional_ids = selected - existing_ids
+        known_candidates = {item.id: item for item in analysis.candidate_clips}
+        if not additional_ids.issubset(known_candidates):
+            raise ValueError("补选包含未知候选，请重新生成方案")
+        for candidate in analysis.candidate_clips:
+            if candidate.id not in additional_ids:
+                continue
+            segment = self._segments_from_candidates([candidate], plan.delivery_spec)[0]
+            segment = segment.model_copy(update={
+                "order": max((item.order for item in segments), default=0) + 1,
+            })
+            segments.append(segment)
+            decisions.append(CandidateDecision(
+                task_id=task_id,
+                plan_id=plan.id,
+                plan_version=plan.version + 1,
+                candidate_id=candidate.id,
+                action="auto_add",
+                after=segment.model_dump(mode="json"),
+                actor_id=actor_id,
+            ))
         for raw in manual_segments or []:
             candidate_id = str(raw.get("candidate_id") or new_id("manual_candidate"))
             source_start = float(raw["source_start"])

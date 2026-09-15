@@ -32,6 +32,7 @@ class ScriptAgent(BaseAgent):
         requirement: VideoRequirement,
         requirement_items: Optional[list[RequirementItem]] = None,
         duration_tolerance: Optional[float] = None,
+        transition_duration: float = 0.0,
     ) -> EditScript:
         self._start_timer()
         must_ids = {
@@ -44,6 +45,7 @@ class ScriptAgent(BaseAgent):
             analysis.source_durations or analysis.video_duration,
             must_requirement_ids=must_ids,
             duration_tolerance=duration_tolerance,
+            transition_duration=transition_duration,
         )
         operations = [
             EditOperation(
@@ -57,6 +59,7 @@ class ScriptAgent(BaseAgent):
             for index, clip in enumerate(selected, start=1)
         ]
         estimated_duration = sum(clip.end - clip.start for clip in selected)
+        estimated_duration -= transition_duration * max(0, len(selected) - 1)
         subtitles = (
             self._build_remapped_srt(analysis.transcript, selected)
             if requirement.need_subtitles
@@ -69,6 +72,7 @@ class ScriptAgent(BaseAgent):
             estimated_duration=estimated_duration,
             operations=operations,
             srt_subtitles=subtitles,
+            transition_duration=transition_duration,
             notes="片段已按原始时间顺序排列；导出前可删除不需要的片段。",
         )
 
@@ -79,13 +83,15 @@ class ScriptAgent(BaseAgent):
         video_duration: float | dict[str, float],
         must_requirement_ids: Optional[set[str]] = None,
         duration_tolerance: Optional[float] = None,
+        transition_duration: float = 0.0,
+        already_selected: Optional[list[HighlightClip]] = None,
     ) -> list[HighlightClip]:
         """先覆盖 must，再按评分补足预算；普通预算不能静默删除 must。"""
         tolerance = target_duration * 0.1 if duration_tolerance is None else duration_tolerance
-        minimum_duration = max(0.0, target_duration - tolerance)
         budget = target_duration + tolerance
-        selected: list[HighlightClip] = []
-        total = 0.0
+        selected: list[HighlightClip] = list(already_selected or [])
+        total = sum(item.end - item.start for item in selected)
+        total -= transition_duration * max(0, len(selected) - 1)
         must_ids = set(must_requirement_ids or set())
 
         def normalise_clip(clip: HighlightClip) -> Optional[HighlightClip]:
@@ -103,7 +109,9 @@ class ScriptAgent(BaseAgent):
                 return None
             return clip.model_copy(update={"start": start, "end": end})
 
-        uncovered = set(must_ids)
+        uncovered = set(must_ids) - {
+            requirement_id for item in selected for requirement_id in item.matched_requirement_ids
+        }
         must_candidates = sorted(
             highlights,
             key=lambda item: (
@@ -119,25 +127,27 @@ class ScriptAgent(BaseAgent):
             candidate = normalise_clip(clip)
             if candidate is None or any(self._overlap(candidate, kept) for kept in selected):
                 continue
+            overlap_cost = transition_duration if selected else 0.0
             selected.append(candidate)
             uncovered.difference_update(covers)
-            total += candidate.end - candidate.start
+            total += candidate.end - candidate.start - overlap_cost
             if not uncovered:
                 break
 
         for clip in self._diverse_order(highlights, selected):
+            if total >= target_duration:
+                break
             candidate = normalise_clip(clip)
             if candidate is None:
                 continue
             duration = candidate.end - candidate.start
-            if total + duration > budget and selected:
+            overlap_cost = transition_duration if selected else 0.0
+            if total + duration - overlap_cost > budget and selected:
                 continue
             if any(self._overlap(candidate, kept) for kept in selected):
                 continue
             selected.append(candidate)
-            total += duration
-            if total >= minimum_duration:
-                break
+            total += duration - overlap_cost
 
         return sorted(
             selected,

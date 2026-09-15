@@ -1,4 +1,4 @@
-import ast
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -208,9 +208,8 @@ def test_material_interview_agent_only_accepts_retrieved_source_evidence():
             return [(list(items)[0], 0.9)]
 
     def runner(**kwargs):
-        result = kwargs["tool_handlers"]["search_material_evidence"](
-            "活动介绍", 3
-        )
+        request = json.loads(kwargs["user_message"])
+        evidence_id = request["retrieved_evidence"][0]["evidence_id"]
         return {
             "questions": [
                 {
@@ -220,7 +219,7 @@ def test_material_interview_agent_only_accepts_retrieved_source_evidence():
                     "impact": "会影响开场信息量和后续内容可用时长。",
                     "answer_hint": "例如：背景简短带过，完整保留活动目标",
                     "supporting_evidence_ids": [
-                        result["evidence"][0]["evidence_id"], "invented"
+                        evidence_id, "invented"
                     ],
                 }
             ]
@@ -515,7 +514,7 @@ def test_requirement_compiler_creates_visible_execution_instruction(monkeypatch)
     assert {slot.key for slot in compilation.slots} >= {
         "target_duration", "focus_keywords", "publish_channel", "high_risk_review"
     }
-    assert next(slot for slot in compilation.slots if slot.key == "target_duration").source_type == "llm"
+    assert next(slot for slot in compilation.slots if slot.key == "target_duration").source_type == "user_input"
 
 
 def test_embedding_requests_are_split_into_batches_of_ten(monkeypatch):
@@ -618,7 +617,7 @@ def test_tool_calling_forces_final_json_and_repairs_truncated_output(monkeypatch
     assert "tools" not in calls[2]
 
 
-def test_candidate_fallback_suggestions_are_not_exportable():
+def test_candidate_fallback_suggestions_are_reviewable_with_visible_risk():
     requirement = RequirementItem(description="保留颁奖", priority="should")
     evidence = EvidenceBuilder.from_transcript([
         TranscriptSegment(start=0, end=4, text="现在开始颁奖仪式")
@@ -639,8 +638,8 @@ def test_candidate_fallback_suggestions_are_not_exportable():
 
     assert result.degraded
     assert result.candidates
-    assert not result.valid_candidates
-    assert "candidate_ai_unavailable_not_exportable" in result.candidates[0].risk_flags
+    assert result.valid_candidates
+    assert "code_retrieved_review_required" in result.candidates[0].risk_flags
 
 
 def test_candidate_ending_before_continuation_is_rejected():
@@ -681,27 +680,13 @@ def test_candidate_agent_expands_mid_sentence_candidate_to_complete_expression()
     )
 
     def runner(**kwargs):
-        result = kwargs["tool_handlers"]["search_evidence"](
-            requirement_id=requirement.id,
-            query="办法",
-            top_k=1,
-        )
-        item = result["evidence"][0]
-        return {"candidates": [{
-            "source_start": item["source_start"],
-            "source_end": item["source_end"],
-            "matched_requirement_ids": [requirement.id],
-            "citations": [{
-                "requirement_id": requirement.id,
-                "evidence_id": item["evidence_id"],
-                "quote": "我们采取了很多办法",
-                "relation": "direct",
-                "retrieval_score": item["retrieval_score"],
-            }],
-            "selection_reason": "说明活动经验",
+        request = json.loads(kwargs["user_message"])
+        item = request["retrieved_evidence"][0]
+        return {"selections": [{
+            "evidence_id": item["evidence_id"],
+            "requirement_ids": [requirement.id],
+            "reason": "说明活动经验",
             "confidence": 0.8,
-            "suggested_duration": 2,
-            "risk_flags": [],
         }]}
 
     result = CandidateAgent(
@@ -737,29 +722,23 @@ def test_candidate_agent_batches_requirements_and_builds_citations_in_code():
     calls = []
 
     def runner(**kwargs):
-        request = ast.literal_eval(kwargs["user_message"])
-        requirement_id = request["requirements"][0]["id"]
+        request = json.loads(kwargs["user_message"])
         calls.append({
             "requirement_count": len(request["requirements"]),
             "max_tokens": kwargs["max_tokens"],
-            "requirement_id": requirement_id,
+            "requirement_ids": [item["id"] for item in request["requirements"]],
         })
-        result = kwargs["tool_handlers"]["search_evidence"](
-            requirement_id=requirement_id,
-            query=request["requirements"][0]["description"],
-            top_k=1,
-        )
-        item = result["evidence"][0]
-        return {"selections": [{
-            "evidence_id": item["evidence_id"],
-            "source_start": item["source_start"],
-            "source_end": item["source_end"],
-            "reason": "与当前要求直接相关",
-            "confidence": 0.9,
-            # 即使模型额外返回伪造字段，代码也不能采用。
-            "quote": "伪造引文",
-            "retrieval_score": 0.01,
-        }]}
+        return {"selections": [
+            {
+                "evidence_id": item["evidence_id"],
+                "requirement_ids": item["possible_requirement_ids"],
+                "reason": "与当前要求直接相关",
+                "confidence": 0.9,
+                "quote": "伪造引文",
+                "retrieval_score": 0.01,
+            }
+            for item in request["retrieved_evidence"]
+        ]}
 
     result = CandidateAgent(
         llm_runner=runner,
@@ -772,10 +751,10 @@ def test_candidate_agent_batches_requirements_and_builds_citations_in_code():
         transcript=transcript,
     )
 
-    assert len(calls) == 2
-    assert all(call["requirement_count"] == 1 for call in calls)
+    assert len(calls) == 1
+    assert calls[0]["requirement_count"] == 2
     assert all(call["max_tokens"] == CandidateAgent.BATCH_MAX_TOKENS for call in calls)
-    assert {call["requirement_id"] for call in calls} == {first.id, second.id}
+    assert set(calls[0]["requirement_ids"]) == {first.id, second.id}
     assert len(result.valid_candidates) == 2
     assert {citation.quote for item in result.valid_candidates for citation in item.citations} == {
         "主持人宣布活动正式开幕",
@@ -788,7 +767,7 @@ def test_candidate_agent_batches_requirements_and_builds_citations_in_code():
     )
 
 
-def test_candidate_agent_isolates_failed_requirement_batch():
+def test_candidate_agent_falls_back_once_for_the_whole_batch():
     failed = RequirementItem(description="保留不存在的领导讲话", priority="should")
     successful = RequirementItem(description="保留颁奖结果", priority="should")
     transcript = [
@@ -801,27 +780,12 @@ def test_candidate_agent_isolates_failed_requirement_batch():
         requirement_spec_version=1,
         visible_instruction="分别分析两个要求。",
     )
-    attempts = {failed.id: 0, successful.id: 0}
+    attempts = 0
 
     def runner(**kwargs):
-        request = ast.literal_eval(kwargs["user_message"])
-        requirement_id = request["requirements"][0]["id"]
-        attempts[requirement_id] += 1
-        if requirement_id == failed.id:
-            raise RuntimeError("simulated batch truncation")
-        result = kwargs["tool_handlers"]["search_evidence"](
-            requirement_id=requirement_id,
-            query="颁奖",
-            top_k=1,
-        )
-        item = result["evidence"][0]
-        return {"selections": [{
-            "evidence_id": item["evidence_id"],
-            "source_start": item["source_start"],
-            "source_end": item["source_end"],
-            "reason": "颁奖结果",
-            "confidence": 0.9,
-        }]}
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("simulated batch truncation")
 
     result = CandidateAgent(
         llm_runner=runner,
@@ -834,16 +798,15 @@ def test_candidate_agent_isolates_failed_requirement_batch():
         transcript=transcript,
     )
 
-    assert attempts[failed.id] == CandidateAgent.BATCH_ATTEMPTS
-    assert attempts[successful.id] == 1
+    assert attempts == 1
     assert result.degraded
-    assert result.failed_requirement_ids == [failed.id]
+    assert set(result.failed_requirement_ids) == {failed.id, successful.id}
     assert any(
         successful.id in candidate.matched_requirement_ids
         for candidate in result.valid_candidates
     )
     assert all(
-        "candidate_generation_fallback" not in candidate.risk_flags
+        "code_retrieved_review_required" in candidate.risk_flags
         for candidate in result.valid_candidates
     )
 
@@ -1141,27 +1104,10 @@ def test_alignment_decision_revises_taskbook_and_reuses_cached_transcript(
 
     created = orchestrator.create_requirement_draft("input.mp4", brief.raw_text)
 
-    assert created.alignment_proposal.requires_user_decision
+    assert created.alignment_proposal is None
     assert analysis_agent.calls == 1
     assert (orchestrator.task_dir / "material_analysis.json").exists()
     assert orchestrator.status.task_snapshot.state == "requirement_draft"
-
-    with pytest.raises(ValueError, match="请先处理素材与需求对齐建议"):
-        orchestrator.confirm_requirement_draft(
-            orchestrator.status.requirement_gate.id,
-            actor_id="tester",
-        )
-
-    revised = orchestrator.resolve_material_alignment("adopt", actor_id="tester")
-
-    assert revised.spec.version == 2
-    assert revised.spec.purpose == "主题党日活动访谈摘要"
-    assert [item.description for item in revised.spec.requirements] == [
-        "参与活动的感受",
-        "对活动的改进建议",
-        "人物发言或问答必须保留完整，不在表达中途截断",
-    ]
-    assert (orchestrator.task_dir / "material_alignment_decision.json").exists()
 
     orchestrator.confirm_requirement_draft(orchestrator.status.requirement_gate.id, "tester")
     orchestrator.analyze_confirmed_requirement("input.mp4")
@@ -1314,9 +1260,9 @@ def test_compliance_requirement_is_not_used_as_clip_search_target():
     seen_requirements = []
 
     def runner(**kwargs):
-        request = ast.literal_eval(kwargs["user_message"])
+        request = json.loads(kwargs["user_message"])
         seen_requirements.extend(item["id"] for item in request["requirements"])
-        return {"candidates": []}
+        return {"selections": []}
 
     CandidateAgent(
         llm_runner=runner,
@@ -1411,14 +1357,14 @@ def test_requirement_compiler_failure_creates_visible_manual_draft(monkeypatch):
         },
     )
 
-    assert compilation.mode == "manual_required"
+    assert compilation.mode == "material_assisted"
     assert compilation.brief.raw_text == "制作企业年会回顾，重点内容稍后人工填写"
     assert compilation.legacy_requirement.target_duration == 120
     assert compilation.legacy_requirement.focus_keywords == []
     assert not compilation.legacy_requirement.need_subtitles
-    assert compilation.warnings
+    assert not compilation.warnings
     assert compilation.spec.open_questions == []
-    assert compilation.execution_brief.visible_instruction.startswith("注意：AI 需求解析失败")
+    assert not compilation.execution_brief.visible_instruction.startswith("注意：AI 需求解析失败")
 
 
 def test_requirement_item_requires_acceptance_rule_for_must_and_prohibited():
@@ -1822,28 +1768,14 @@ def test_candidate_agent_can_only_use_tool_retrieved_evidence():
     )
 
     def fake_tool_calling_runner(**kwargs):
-        result = kwargs["tool_handlers"]["search_evidence"](
-            requirement_id=requirement.id,
-            query="颁奖",
-            top_k=3,
-        )
-        item = result["evidence"][0]
+        request = json.loads(kwargs["user_message"])
+        item = request["retrieved_evidence"][0]
         return {
-            "candidates": [{
-                "source_start": item["source_start"],
-                "source_end": item["source_end"],
-                "matched_requirement_ids": [requirement.id],
-                "citations": [{
-                    "requirement_id": requirement.id,
-                    "evidence_id": item["evidence_id"],
-                    "quote": "开始颁奖仪式",
-                    "relation": "direct",
-                    "retrieval_score": item["retrieval_score"],
-                }],
-                "selection_reason": "原文明确出现颁奖仪式",
+            "selections": [{
+                "evidence_id": item["evidence_id"],
+                "requirement_ids": [requirement.id],
+                "reason": "原文明确出现颁奖仪式",
                 "confidence": 0.9,
-                "suggested_duration": 4,
-                "risk_flags": [],
             }]
         }
 
@@ -1915,7 +1847,7 @@ def test_hybrid_retrieval_rejects_non_finite_embedding_values():
     assert retriever.dense is None
 
 
-def test_candidate_rejects_existing_evidence_not_returned_by_tool():
+def test_candidate_ignores_legacy_model_payload_and_uses_code_retrieval():
     requirement = RequirementItem(description="保留颁奖", priority="should")
     evidence = EvidenceBuilder.from_transcript(
         [TranscriptSegment(start=20, end=24, text="下面开始颁奖仪式")]
@@ -1951,8 +1883,9 @@ def test_candidate_rejects_existing_evidence_not_returned_by_tool():
         retriever=HybridEvidenceRetriever(),
     ).run(execution, [requirement], evidence, video_duration=60)
 
-    assert not result.valid_candidates
-    assert f"evidence_not_retrieved:{evidence[0].id}" in result.candidates[0].risk_flags
+    assert result.valid_candidates
+    assert result.valid_candidates[0].citations[0].quote == evidence[0].content
+    assert "code_retrieved_review_required" in result.valid_candidates[0].risk_flags
 
 
 def test_script_plan_remaps_subtitles_to_output_timeline():

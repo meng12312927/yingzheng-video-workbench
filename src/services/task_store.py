@@ -67,7 +67,7 @@ class TaskStore:
         slots: list[RequirementSlot] | None = None,
     ) -> ReviewGate:
         """写入一个需求草稿，并创建唯一可批准的 requirement Gate。"""
-        if generation_mode not in {"llm_generated", "manual_required"}:
+        if generation_mode not in {"llm_generated", "manual_required", "material_assisted"}:
             raise ValueError("未知的需求编译模式")
         if spec.brief_id != brief.id:
             raise ValueError("RequirementSpec 必须引用同一个 RequirementBrief")
@@ -95,6 +95,7 @@ class TaskStore:
         )
         self.write_payload("review_gates.json", self._replace_gate(gate))
         manual_required = generation_mode == "manual_required"
+        material_assisted = generation_mode == "material_assisted"
         self.append_audit(
             AuditEvent(
                 task_id=self.task_id,
@@ -107,7 +108,11 @@ class TaskStore:
                 summary=(
                     "AI 需求解析失败；系统保留原始需求并创建了等待人工核对的草稿。"
                     if manual_required
-                    else "系统生成了可编辑的需求任务书和 AI 执行说明。"
+                    else (
+                        "系统先建立不臆测的任务书骨架，等待结合素材和用户确认。"
+                        if material_assisted
+                        else "系统生成了可编辑的需求任务书和 AI 执行说明。"
+                    )
                 ),
                 metadata={"generation_mode": generation_mode},
             )

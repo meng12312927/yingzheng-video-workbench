@@ -76,6 +76,7 @@ from src.models.schemas import (
     TaskMaterialSet,
 )
 from src.services.media_assets import MediaAssetService
+from src.services.evidence import BM25EvidenceRetriever
 from src.services.mobile_review import MobileReviewService
 from src.services.infrastructure import (
     PostgresTaskMetadataRepository,
@@ -120,11 +121,16 @@ class VideoEditOrchestrator:
         self.material_interview_agent = MaterialInterviewAgent()
         self.agent2 = AnalysisAgent(whisper_model_size=WHISPER_MODEL_SIZE)
         self.candidate_agent = CandidateAgent()
+        # 两个阶段复用同一份素材向量矩阵，避免同一批转录重复请求 Embedding。
+        self.candidate_agent.retriever = self.material_interview_agent.retriever
         self.style_agent = StyleRecommendationAgent()
         self.agent3 = ScriptAgent()
         self.agent4 = ExecutorAgent()
         self.plan_service = EditPlanService()
-        self.media_asset_service = MediaAssetService()
+        self.media_asset_service = MediaAssetService(
+            cache_root=OUTPUT_DIR / "cache" / "source_analysis",
+            cache_namespace=WHISPER_MODEL_SIZE,
+        )
         self.timeline_compiler = TimelineCompiler()
         self.reference_document_service = ReferenceDocumentService()
         self.mobile_review_service = MobileReviewService()
@@ -436,7 +442,7 @@ class VideoEditOrchestrator:
             with model_call_context(
                 self.task_dir,
                 stage="material_interview",
-                prompt_template_version="material-interview-v1-tools",
+                prompt_template_version="material-interview-v2-batch",
                 input_spec_id=compilation.spec.id,
                 input_spec_version=version,
             ):
@@ -487,7 +493,7 @@ class VideoEditOrchestrator:
                 f"material_interview_questions_v{version}.json",
                 {
                     "source": "ai_with_retrieved_evidence",
-                    "prompt_template_version": "material-interview-v1-tools",
+                    "prompt_template_version": "material-interview-v2-batch",
                     "questions": [item.model_dump(mode="json") for item in questions],
                 },
             )
@@ -499,7 +505,7 @@ class VideoEditOrchestrator:
                 f"material_interview_questions_v{version}.json",
                 {
                     "source": "ai_failed",
-                    "prompt_template_version": "material-interview-v1-tools",
+                    "prompt_template_version": "material-interview-v2-batch",
                     "questions": [],
                     "error_type": type(error).__name__,
                 },
@@ -518,6 +524,7 @@ class VideoEditOrchestrator:
         scenario: str = "school",
         overrides: Optional[dict] = None,
         submitted_by: Optional[str] = None,
+        progress_callback=None,
     ) -> RequirementCompilation:
         """创建任务书，并预先理解素材以生成可审核的需求对齐建议。"""
         self.status = PipelineStatus(step="created", started_at=datetime.now().isoformat())
@@ -593,17 +600,12 @@ class VideoEditOrchestrator:
         )
 
         try:
-            with model_call_context(
-                self.task_dir,
-                stage="requirement_compilation",
-                prompt_template_version="requirement-compiler-v1",
-            ):
-                compilation = self.agent1.compile(
-                    user_input,
-                    scenario=scenario,
-                    submitted_by=submitted_by,
-                    overrides=overrides,
-                )
+            compilation = self.agent1.compile(
+                user_input,
+                scenario=scenario,
+                submitted_by=submitted_by,
+                overrides=overrides,
+            )
             aggregate_analysis: ContentAnalysis | None = None
             analysis_agent = getattr(self, "agent2", None)
             if analysis_agent is not None:
@@ -627,19 +629,12 @@ class VideoEditOrchestrator:
                     analysis_agent,
                     self.store,
                     run_in_context=analyze_source,
+                    progress_callback=progress_callback,
                 )
                 self.status.material_set = material_set
-                compilation = self._analyze_material_alignment(
-                    aggregate_analysis, compilation
+                compilation = self._generate_material_interview_questions(
+                    compilation, aggregate_analysis
                 )
-            proposal = compilation.alignment_proposal
-            # 有明显模糊或错位时，先让用户决定是否采用素材驱动建议；决定后再动态追问。
-            if proposal is None or not proposal.requires_user_decision:
-                compilation = self._generate_clarification_questions(compilation)
-                if aggregate_analysis is not None:
-                    compilation = self._generate_material_interview_questions(
-                        compilation, aggregate_analysis
-                    )
         except Exception as error:
             self._fail_task("requirement_compilation_failed", error)
             raise
@@ -1023,37 +1018,10 @@ class VideoEditOrchestrator:
             f"requirement-confirmed-v{spec.version}",
             actor_id=actor_id,
         )
-        proposals = []
-        style_agent = getattr(self, "style_agent", None)
-        if style_agent:
-            brief = self.store.read_model("requirement_brief.json", RequirementBrief)
-            with model_call_context(
-                self.task_dir,
-                stage="style_recommendation",
-                prompt_template_version="style-recommender-v1",
-                input_spec_id=spec.id,
-                input_spec_version=spec.version,
-            ):
-                proposals = style_agent.run(spec, brief.scenario)
-        self.status.style_proposals = proposals
-        if proposals:
-            self.store.write_payload(
-                f"style_proposals_v{spec.version}.json",
-                {"proposals": [item.model_dump(mode="json") for item in proposals]},
-            )
-            self.store.append_audit(
-                AuditEvent(
-                    task_id=self.store.task_id,
-                    action="style_recommended",
-                    subject_type="RequirementSpec",
-                    subject_id=spec.id,
-                    subject_version=spec.version,
-                    summary=f"系统从受控样式库推荐了 {len(proposals)} 组方案。",
-                )
-            )
-            self._transition("style_recommended", f"style-recommended-v{spec.version}")
-        else:
-            self._transition("style_skipped", f"style-skipped-v{spec.version}")
+        # 风格、字幕和音乐已经在同一次任务书确认中由用户选择，不再新增一次
+        # LLM 推荐和审批步骤。渲染细节仍可在方案页高级设置中修改。
+        self.status.style_proposals = []
+        self._transition("style_skipped", f"style-confirmed-in-taskbook-v{spec.version}")
         self.status.step = self.status.task_snapshot.state
         self._write_manifest(self.status.step, requirement_version=str(spec.version))
         return spec
@@ -1126,6 +1094,8 @@ class VideoEditOrchestrator:
             "audience": revised_spec.audience,
             "target_duration": revised_spec.target_duration,
             "style": revised_spec.style,
+            "need_subtitles": revised_spec.need_subtitles,
+            "need_bgm": revised_spec.need_bgm,
         }
         revised_slots = [
             slot.model_copy(update={
@@ -1220,7 +1190,7 @@ class VideoEditOrchestrator:
             with model_call_context(
                 self.task_dir,
                 stage="candidate_analysis",
-                prompt_template_version="candidate-tools-v2-batched",
+                prompt_template_version="candidate-ranker-v3-single-call",
                 input_spec_id=spec.id,
                 input_spec_version=spec.version,
             ):
@@ -1332,6 +1302,7 @@ class VideoEditOrchestrator:
                 requirement,
                 spec.requirements,
                 duration_tolerance=spec.duration_tolerance,
+                transition_duration=0.35,
             )
         except Exception as error:
             self._fail_task("planning_failed", error)
@@ -1342,6 +1313,16 @@ class VideoEditOrchestrator:
         plan_service = getattr(self, "plan_service", None) or EditPlanService()
         try:
             plan = plan_service.create(spec=spec, analysis=analysis, script=script)
+            if getattr(generation, "duration_plan", None):
+                actual_budget = self.candidate_agent.duration_planner.complete(
+                    generation.duration_plan, [plan.estimated_duration]
+                )
+                self.store.write_model("duration_budget.json", actual_budget)
+                generation_payload = json.loads(
+                    (self.task_dir / "candidate_generation.json").read_text(encoding="utf-8")
+                )
+                generation_payload["duration_plan"] = actual_budget.model_dump(mode="json")
+                self.store.write_payload("candidate_generation.json", generation_payload)
             plan_gate = self.store.save_plan_draft(plan)
         except Exception as error:
             self._fail_task("planning_failed", error)
@@ -1659,6 +1640,95 @@ class VideoEditOrchestrator:
             "awaiting_review",
             edit_plan_version=str(revised.version),
         )
+        return revised
+
+    def supplement_plan_duration(
+        self,
+        *,
+        excluded_ranges: Optional[list[dict]] = None,
+        actor_id: Optional[str] = None,
+    ) -> AuditableEditPlan:
+        """复用转录补选备用片段；保留用户当前选择，不重新调用模型或恢复已删除画面。"""
+        if not self.store or not self.status.analysis or not self.status.edit_plan:
+            raise ValueError("请先生成剪辑方案")
+        analysis, plan, spec = (
+            self.status.analysis, self.status.edit_plan, self.status.requirement_spec
+        )
+        if spec is None or self.status.execution_brief is None:
+            raise ValueError("当前任务书尚未确认")
+        generator = CandidateAgent(retriever=BM25EvidenceRetriever())
+        reserve = generator.run(
+            self.status.execution_brief, spec.requirements, analysis.evidence,
+            analysis.source_durations or analysis.video_duration,
+            target_duration=spec.target_duration,
+            duration_tolerance=spec.duration_tolerance,
+            transcript=analysis.transcript,
+            rank_with_model=False,
+        )
+        candidates = list(analysis.candidate_clips)
+        known_ranges = {
+            (item.source_asset_id, round(item.source_start, 3), round(item.source_end, 3))
+            for item in candidates
+        }
+        for candidate in reserve.valid_candidates:
+            key = (candidate.source_asset_id, round(candidate.source_start, 3), round(candidate.source_end, 3))
+            if key not in known_ranges:
+                candidates.append(candidate)
+                known_ranges.add(key)
+        def as_highlight(item):
+            return HighlightClip(
+                start=item.source_start, end=item.source_end,
+                source_asset_id=item.source_asset_id,
+                text=" ".join(citation.quote for citation in item.citations),
+                importance=item.confidence, category="highlight",
+                reason=item.selection_reason, candidate_id=item.id,
+                matched_requirement_ids=item.matched_requirement_ids,
+                evidence_ids=[citation.evidence_id for citation in item.citations],
+            )
+        kept = [HighlightClip(
+            start=item.source_start, end=item.source_end,
+            source_asset_id=item.source_asset_id, text=item.subtitle_text or "",
+            importance=1.0, category="highlight", reason="保留你已审核的片段",
+            candidate_id=item.candidate_id, matched_requirement_ids=item.matched_requirement_ids,
+            evidence_ids=item.evidence_ids,
+        ) for item in plan.timeline_segments]
+        choices = [
+            as_highlight(item) for item in candidates
+            if not any(
+                item.source_asset_id == blocked.get("source_asset_id")
+                and max(item.source_start, blocked["start"]) < min(item.source_end, blocked["end"])
+                for blocked in (excluded_ranges or [])
+            )
+        ]
+        card_seconds = 2.0 * sum(
+            style != "none" for style in (plan.delivery_spec.intro_style, plan.delivery_spec.outro_style)
+        )
+        selected = self.agent3._select_clips(
+            choices, max(0.0, spec.target_duration - card_seconds),
+            analysis.source_durations or analysis.video_duration,
+            must_requirement_ids={item.id for item in spec.requirements if item.priority == "must"},
+            duration_tolerance=spec.duration_tolerance,
+            transition_duration=plan.delivery_spec.transition_duration,
+            already_selected=kept,
+        )
+        self.status.analysis = analysis.model_copy(update={"candidate_clips": candidates})
+        self.store.write_model("analysis.json", self.status.analysis)
+        self.store.write_payload("candidate_clips.json", {
+            "candidates": [item.model_dump(mode="json") for item in candidates]
+        })
+        revised = self.revise_edit_plan(
+            selected_candidate_ids=[item.candidate_id for item in selected], actor_id=actor_id,
+        )
+        budget = generator.duration_planner.complete(reserve.duration_plan, [revised.estimated_duration])
+        self.store.write_model("duration_budget.json", budget)
+        self.store.append_audit(AuditEvent(
+            task_id=self.store.task_id, action="duration_supplemented",
+            subject_type="AuditableEditPlan", subject_id=revised.id,
+            subject_version=revised.version, actor_type="user", actor_id=actor_id,
+            summary=f"用户请求自动补选，预计时长从 {plan.estimated_duration:.1f} 秒调整为 {revised.estimated_duration:.1f} 秒；未调用 LLM 或重复转录。",
+            metadata={"excluded_ranges": json.dumps(excluded_ranges or [], ensure_ascii=False)},
+        ))
+        self.preview_paths = {}
         return revised
 
     def create_mobile_review_link(
@@ -2221,6 +2291,59 @@ class VideoEditOrchestrator:
             ):
                 previews[str(operation.order)] = str(preview_path.resolve())
         return previews
+
+    def create_preview_for_order(self, order: int, context_seconds: float = 0.0) -> str:
+        """用户点击候选时才生成单段预览，并复用已经存在的文件。"""
+        if not self.task_dir or not self.status.edit_plan:
+            raise ValueError("当前没有可预览的剪辑方案")
+        segment = next(
+            (
+                item for item in self.status.edit_plan.timeline_segments
+                if item.order == int(order)
+            ),
+            None,
+        )
+        if segment is None:
+            raise ValueError("找不到这个候选片段")
+        source_path = self.video_path or ""
+        source_duration = (
+            self.status.analysis.source_durations.get(segment.source_asset_id or "", self.status.analysis.video_duration)
+            if self.status.analysis else segment.source_end
+        )
+        if self.status.material_set:
+            source = next(
+                (
+                    item for item in self.status.material_set.sources
+                    if item.id == segment.source_asset_id
+                ),
+                None,
+            )
+            if source:
+                source_path = source.source_path
+                source_duration = source.duration
+        candidate = next((
+            item for item in (self.status.analysis.candidate_clips if self.status.analysis else [])
+            if item.id == segment.candidate_id
+        ), None)
+        base_start = candidate.source_start if candidate else segment.source_start
+        base_end = candidate.source_end if candidate else segment.source_end
+        start = max(0.0, base_start - context_seconds) if context_seconds else segment.source_start
+        end = min(source_duration, base_end + context_seconds) if context_seconds else segment.source_end
+        preview_dir = self.task_dir / "previews"
+        preview_dir.mkdir(exist_ok=True)
+        preview_path = preview_dir / (
+            f"clip_{segment.order:02d}_{start:.2f}_{end:.2f}.mp4"
+        )
+        if not preview_path.exists() and not FFmpegTool.create_preview(
+            source_path,
+            start,
+            end,
+            str(preview_path),
+        ):
+            raise ValueError("片段预览生成失败，请直接在原素材中核对")
+        resolved = str(preview_path.resolve())
+        self.preview_paths[str(segment.order)] = resolved
+        return resolved
 
     def _transition(
         self,

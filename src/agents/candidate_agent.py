@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from src.agents.base import BaseAgent
@@ -16,7 +17,7 @@ from src.models.schemas import (
 )
 from src.services.evidence import EvidenceValidator, HybridEvidenceRetriever
 from src.services.duration_planner import DurationBudgetPlanner
-from src.tools.llm import call_llm_with_tools, embed_texts
+from src.tools.llm import call_llm, embed_texts
 
 
 TOOL_DEFINITIONS = [
@@ -187,22 +188,367 @@ class CandidateGenerationResult:
 
 
 class CandidateAgent(BaseAgent):
-    """按单项需求生成小型候选 JSON，再由代码补齐并验证证据字段。"""
+    """代码批量检索、LLM 一次排序、确定性补齐和验证候选。"""
 
-    MAX_CANDIDATES = 18
-    MAX_CANDIDATES_PER_REQUIREMENT = 8
-    BATCH_ATTEMPTS = 2
-    BATCH_MAX_TOKENS = 1000
+    MAX_CANDIDATES = 60
+    MAX_MODEL_CANDIDATES = 18
+    MAX_CANDIDATES_PER_REQUIREMENT = 60
+    BATCH_ATTEMPTS = 1
+    BATCH_MAX_TOKENS = 1400
 
     def __init__(self, llm_runner: Optional[Callable] = None, retriever=None):
         super().__init__("CandidateAgent")
-        self.llm_runner = llm_runner or call_llm_with_tools
+        self.llm_runner = llm_runner or call_llm
         self.retriever = retriever or HybridEvidenceRetriever(embedding_fn=embed_texts)
         self.validator = EvidenceValidator()
         self.boundary_validator = SpeechBoundaryValidator()
         self.duration_planner = DurationBudgetPlanner()
 
     def run(
+        self,
+        execution_brief: ExecutionBrief,
+        requirements: Iterable[RequirementItem],
+        evidence: Iterable[Evidence],
+        video_duration: float | dict[str, float],
+        target_duration: Optional[float] = None,
+        duration_tolerance: Optional[float] = None,
+        transcript: Optional[Iterable[TranscriptSegment]] = None,
+        rank_with_model: bool = True,
+    ) -> CandidateGenerationResult:
+        """一次检索、一次排序，并用确定性候选补足时长预算。"""
+        requirements = list(requirements)
+        evidence = [item for item in evidence if item.type == "transcript"]
+        transcript = list(transcript or [])
+        if hasattr(self.retriever, "begin_run"):
+            self.retriever.begin_run()
+        selectable = [
+            item for item in requirements
+            if item.category == "content" and item.priority != "prohibited"
+        ]
+        prohibited_ids = {item.id for item in requirements if item.priority == "prohibited"}
+        requirement_by_id = {item.id: item for item in selectable}
+        evidence_by_id = {item.id: item for item in evidence}
+        retrieval_trace: Dict[str, list[str]] = {}
+        retrieval_scores: Dict[tuple[str, str], float] = {}
+        pool: dict[str, dict[str, Any]] = {}
+        available_duration = (
+            sum(video_duration.values())
+            if isinstance(video_duration, dict)
+            else float(video_duration)
+        )
+        desired_duration = float(target_duration or min(available_duration, 120.0))
+        tolerance = float(duration_tolerance or 0.0)
+        duration_plan = self.duration_planner.build(
+            selectable,
+            target_duration=desired_duration,
+            duration_tolerance=tolerance,
+            available_duration=available_duration,
+        )
+
+        self._start_timer()
+        for requirement in selectable:
+            matches = self.retriever.search(
+                requirement.description,
+                evidence,
+                top_k=self.MAX_CANDIDATES_PER_REQUIREMENT,
+            )
+            retrieval_trace[requirement.id] = [item.id for item, _ in matches]
+            for item, score in matches:
+                retrieval_scores[(requirement.id, item.id)] = score
+                entry = pool.setdefault(item.id, {
+                    "evidence": item,
+                    "requirement_ids": [],
+                    "score": 0.0,
+                })
+                entry["requirement_ids"].append(requirement.id)
+                entry["score"] = max(float(entry["score"]), float(score))
+
+        # 语义检索结果不足以覆盖目标时长时，从整段素材按时间均匀补充可核验窗口。
+        # 这些不是“AI 已确认高光”，只作为有出处的候选供用户审核。
+        if selectable and len(pool) < self.MAX_CANDIDATES:
+            ordered_evidence = sorted(
+                evidence, key=lambda item: (item.source_asset_id or "", item.source_start)
+            )
+            sampled = [item for item in ordered_evidence if item.id not in pool]
+            fallback_requirement = next(
+                (item for item in selectable if item.priority != "must"), None
+            )
+            # 未命中检索的结构性补片不能假装完成某条 must 要求。
+            for item in (sampled if fallback_requirement is not None else []):
+                if len(pool) >= self.MAX_CANDIDATES:
+                    break
+                pool[item.id] = {
+                    "evidence": item,
+                    "requirement_ids": [fallback_requirement.id],
+                    "score": 0.2,
+                }
+                retrieval_trace.setdefault(fallback_requirement.id, []).append(item.id)
+                retrieval_scores[(fallback_requirement.id, item.id)] = 0.2
+
+        ranked_pool = sorted(
+            pool.values(),
+            key=lambda entry: (
+                -max(
+                    (1 if requirement_by_id[item].priority == "must" else 0)
+                    for item in entry["requirement_ids"]
+                ),
+                -float(entry["score"]),
+                entry["evidence"].source_start,
+            ),
+        )[:self.MAX_CANDIDATES]
+        request = {
+            "task": execution_brief.visible_instruction[:1200],
+            "target_duration_seconds": desired_duration,
+            "requirements": [
+                {
+                    "id": item.id,
+                    "description": item.description,
+                    "priority": item.priority,
+                }
+                for item in selectable
+            ],
+            "prohibited_content": [
+                item.description for item in requirements if item.priority == "prohibited"
+            ],
+            "retrieved_evidence": [
+                {
+                    "evidence_id": entry["evidence"].id,
+                    "source_asset_id": entry["evidence"].source_asset_id,
+                    "source_start": entry["evidence"].source_start,
+                    "source_end": entry["evidence"].source_end,
+                    "transcript": entry["evidence"].content[:360],
+                    "possible_requirement_ids": entry["requirement_ids"],
+                }
+                for entry in ranked_pool[:self.MAX_MODEL_CANDIDATES]
+            ],
+            "maximum_selections": self.MAX_MODEL_CANDIDATES,
+        }
+        system_prompt = (
+            "你是活动视频候选排序器。检索已经由程序完成，只能从输入的 retrieved_evidence 中选择。"
+            "优先保证完整表达、任务覆盖、内容多样性和目标时长；不要只按文字相似度排序。"
+            "只返回紧凑 JSON：{\"selections\":[{\"evidence_id\":\"...\","
+            "\"requirement_ids\":[\"...\"],\"reason\":\"简短业务理由\",\"confidence\":0.8}]}。"
+            "不要重复转录原文，不要生成输入之外的 ID，不要输出 Markdown。"
+        )
+        response: dict[str, Any] = {}
+        model_error: Optional[Exception] = None
+        if ranked_pool and rank_with_model:
+            try:
+                response = self.llm_runner(
+                    system_prompt=system_prompt,
+                    user_message=json.dumps(request, ensure_ascii=False),
+                    return_json=True,
+                    temperature=0.0,
+                    max_tokens=self.BATCH_MAX_TOKENS,
+                    max_retries=1,
+                )
+                if not isinstance(response, dict):
+                    raise ValueError("候选排序没有返回 JSON 对象")
+            except Exception as error:
+                model_error = error
+                response = {}
+                self.log(f"批量候选排序失败: {type(error).__name__}", level="warning")
+
+        candidates: list[CandidateClip] = []
+        used_evidence_ids: set[str] = set()
+        pool_by_id = {
+            entry["evidence"].id: entry
+            for entry in ranked_pool[:self.MAX_MODEL_CANDIDATES]
+        }
+        raw_selections = response.get("selections", [])
+        if not isinstance(raw_selections, list):
+            raw_selections = []
+        if ranked_pool and rank_with_model and not raw_selections and model_error is None:
+            model_error = ValueError("empty_ai_ranking")
+        for raw in raw_selections[:self.MAX_MODEL_CANDIDATES]:
+            if not isinstance(raw, dict):
+                continue
+            evidence_id = str(raw.get("evidence_id", ""))
+            entry = pool_by_id.get(evidence_id)
+            if entry is None or evidence_id in used_evidence_ids:
+                continue
+            requested_ids = [
+                item for item in raw.get("requirement_ids", [])
+                if item in entry["requirement_ids"]
+            ]
+            requirement_id = requested_ids[0] if requested_ids else entry["requirement_ids"][0]
+            candidate = self._materialise_selection(
+                raw,
+                requirement_by_id[requirement_id],
+                evidence_by_id,
+                retrieval_trace,
+                retrieval_scores,
+                transcript,
+                video_duration,
+                fallback=False,
+            )
+            if candidate:
+                candidates.append(candidate)
+                used_evidence_ids.add(evidence_id)
+
+        # 先确保每项内容要求至少有一个候选，再用剩余证据补时长。不同要求
+        # 命中同一证据时会在后续合并，并保留各自独立引用。
+        covered_requirement_ids = {
+            item for candidate in candidates for item in candidate.matched_requirement_ids
+        }
+        for requirement in selectable:
+            if requirement.id in covered_requirement_ids:
+                continue
+            matches = [
+                entry for entry in ranked_pool
+                if requirement.id in entry["requirement_ids"]
+            ]
+            if not matches:
+                continue
+            entry = max(
+                matches,
+                key=lambda item: retrieval_scores.get(
+                    (requirement.id, item["evidence"].id), 0.0
+                ),
+            )
+            item = entry["evidence"]
+            candidate = self._materialise_selection(
+                {
+                    "evidence_id": item.id,
+                    "source_start": item.source_start,
+                    "source_end": item.source_end,
+                    "reason": "为保证任务书要求有对应候选，系统加入这段可核验内容供你审核",
+                    "confidence": min(0.78, max(
+                        0.45,
+                        retrieval_scores.get((requirement.id, item.id), 0.2),
+                    )),
+                },
+                requirement,
+                evidence_by_id,
+                retrieval_trace,
+                retrieval_scores,
+                transcript,
+                video_duration,
+                fallback=True,
+            )
+            if candidate:
+                candidates.append(candidate)
+                used_evidence_ids.add(item.id)
+                covered_requirement_ids.add(requirement.id)
+
+        # AI 只负责排序，不再充当唯一可用性门禁。模型少选或失败时，代码按
+        # 可追溯检索结果补到目标时长附近，并将这些片段标为“建议复核”。
+        # 保留备用候选，不能在重叠区间的简单加和达到目标时提前停止。
+        # 真正的预算在 ScriptAgent 去重、选段并扣除转场后计算。
+        for entry in ranked_pool:
+            item = entry["evidence"]
+            if len(candidates) >= self.MAX_CANDIDATES:
+                break
+            if item.id in used_evidence_ids:
+                continue
+            requirement_id = entry["requirement_ids"][0]
+            candidate = self._materialise_selection(
+                {
+                    "evidence_id": item.id,
+                    "source_start": item.source_start,
+                    "source_end": item.source_end,
+                    "reason": (
+                        "根据任务书检索到的相关完整表达，已加入方案供你审核"
+                        if float(entry["score"]) > 0.2
+                        else "为接近目标时长和保持素材结构，系统补充了这段内容供你审核"
+                    ),
+                    "confidence": min(0.78, max(0.45, float(entry["score"]))),
+                },
+                requirement_by_id[requirement_id],
+                evidence_by_id,
+                retrieval_trace,
+                retrieval_scores,
+                transcript,
+                video_duration,
+                fallback=True,
+            )
+            if candidate:
+                candidates.append(candidate)
+                used_evidence_ids.add(item.id)
+
+        candidates = self._merge_duplicate_candidates(candidates)
+        valid_ids: list[str] = []
+        for index, candidate in enumerate(candidates):
+            validation = self.validator.validate(
+                candidate,
+                requirements,
+                evidence,
+                video_duration,
+                allowed_evidence_ids={
+                    evidence_id
+                    for ids in retrieval_trace.values()
+                    for evidence_id in ids
+                },
+            )
+            boundary_warnings = (
+                self.boundary_validator.validate(candidate, transcript)
+                if transcript else ()
+            )
+            prohibited_matches = prohibited_ids.intersection(candidate.matched_requirement_ids)
+            if prohibited_matches:
+                updated = candidate.model_copy(update={
+                    "risk_flags": list(dict.fromkeys([
+                        *candidate.risk_flags,
+                        *[f"prohibited_match:{item_id}" for item_id in sorted(prohibited_matches)],
+                    ]))
+                })
+            elif validation.valid:
+                valid_ids.append(candidate.id)
+                updated = candidate.model_copy(update={
+                    "risk_flags": list(dict.fromkeys([
+                        *candidate.risk_flags,
+                        *boundary_warnings,
+                    ]))
+                })
+            else:
+                updated = candidate.model_copy(update={
+                    "risk_flags": list(dict.fromkeys([
+                        *candidate.risk_flags,
+                        *validation.errors,
+                        *boundary_warnings,
+                    ]))
+                })
+            candidates[index] = updated
+
+        valid_ids = self._limit_valid_candidates(candidates, valid_ids, selectable)
+        valid_set = set(valid_ids)
+        duration_plan = self.duration_planner.complete(
+            duration_plan,
+            (
+                item.source_end - item.source_start
+                for item in candidates if item.id in valid_set
+            ),
+        )
+        covered_ids = {
+            requirement_id
+            for candidate in candidates if candidate.id in valid_set
+            for requirement_id in candidate.matched_requirement_ids
+        }
+        missing_must = [
+            item.id for item in selectable
+            if item.priority == "must" and item.id not in covered_ids
+        ]
+        self._end_timer()
+        self.log(f"一次批量排序生成 {len(candidates)} 个候选，其中 {len(valid_ids)} 个可审核")
+        degradation = getattr(self.retriever, "degradation_reason", None)
+        return CandidateGenerationResult(
+            candidates,
+            valid_ids,
+            retrieval_trace,
+            missing_must,
+            degraded=bool(model_error) or bool(degradation),
+            failure_reason=(
+                f"AI 排序暂不可用，已保留可验证的检索建议：{type(model_error).__name__}"
+                if model_error else degradation
+            ),
+            failed_requirement_ids=(
+                [item.id for item in selectable] if model_error else []
+            ),
+            duration_plan=duration_plan,
+            retrieval_degradation_reason=degradation,
+        )
+
+    def _run_per_requirement_legacy(
         self,
         execution_brief: ExecutionBrief,
         requirements: Iterable[RequirementItem],
@@ -582,7 +928,7 @@ class CandidateAgent(BaseAgent):
             confidence = 0.7
         reason = str(raw.get("reason") or raw.get("selection_reason") or "符合当前任务书要求").strip()
         if fallback:
-            risk_flags.append("candidate_generation_fallback")
+            risk_flags.append("code_retrieved_review_required")
         return CandidateClip(
             source_asset_id=item.source_asset_id,
             source_start=start,

@@ -17,6 +17,7 @@ app.py — Gradio Web 界面
 import html
 import json
 import math
+import re
 import shutil
 import sys
 import threading
@@ -39,7 +40,7 @@ from src.config import (  # noqa: E402
 # 运行时组件只加载一次；每个任务拥有独立 Orchestrator 状态和任务目录。
 _runtime = None
 _task_orchestrators = {}
-MAX_CANDIDATE_CARDS = 18
+MAX_CANDIDATE_CARDS = 60
 
 
 PRIORITY_LABELS = {
@@ -63,6 +64,7 @@ PRIORITY_VALUES = {
     "prohibited": "prohibited",
 }
 STYLE_LABELS = {
+    "general": "待你确认（可在下方直接选择）",
     "formal": "正式稳重",
     "exciting": "精彩有节奏",
     "warm": "温馨自然",
@@ -159,15 +161,19 @@ def _human_duration(seconds):
     return f"{seconds:.0f} 秒"
 
 
+def _editable_requirement_value(value):
+    """待确认标记只用于数据状态，不能变成需要用户手动删除的输入值。"""
+    text = str(value or "").strip()
+    return "" if text in {"待你确认", "待确认", "未知"} else text
+
+
 def _requirement_review_markdown(spec, execution, warnings=None, saved=False):
     """生成统一的用户审核视图，不暴露内部枚举、ID 或提示词字段。"""
     warning_block = ""
     if warnings:
         warning_lines = "\n".join(f"- {html.escape(warning)}" for warning in warnings)
         warning_block = f"""
-> **这份任务书需要你重点核对**
->
-> AI 本次没有完整解析原始需求，已生成可手动修改的基础版本。
+> **有些内容需要你留意**
 
 {warning_lines}
 """
@@ -225,7 +231,7 @@ def _requirement_review_markdown(spec, execution, warnings=None, saved=False):
 
 {execution.visible_instruction}
 
-确认无误后，点击下方“确认任务书并分析素材”。
+用途、观看者、风格和音乐都可以在下方直接修改。确认无误后，点击“确认这些需求并生成方案”。
 """
 
 
@@ -330,8 +336,8 @@ def resolve_alignment_review(workflow_state, edited_text, action):
             ),
             state,
             gr.update(value=_requirement_rows(spec), visible=True),
-            gr.update(value=spec.purpose, visible=True),
-            gr.update(value=spec.audience, visible=True),
+            gr.update(value=_editable_requirement_value(spec.purpose), visible=True),
+            gr.update(value=_editable_requirement_value(spec.audience), visible=True),
             gr.update(value=spec.target_duration),
             gr.update(value=style_label),
             gr.update(value=spec.need_subtitles),
@@ -386,19 +392,24 @@ def load_candidate_cards(plan_state):
     hidden_groups = [gr.update(visible=False) for _ in range(MAX_CANDIDATE_CARDS)]
     hidden_headers = [gr.update(value="") for _ in range(MAX_CANDIDATE_CARDS)]
     hidden_previews = [gr.update(value=None, visible=False) for _ in range(MAX_CANDIDATE_CARDS)]
+    hidden_details = [gr.update(value="") for _ in range(MAX_CANDIDATE_CARDS)]
     hidden_decisions = [gr.update(value="drop") for _ in range(MAX_CANDIDATE_CARDS)]
     hidden_numbers = [gr.update(value=0) for _ in range(MAX_CANDIDATE_CARDS)]
     hidden_text = [gr.update(value="") for _ in range(MAX_CANDIDATE_CARDS)]
+    hidden_origins = [0.0 for _ in range(MAX_CANDIDATE_CARDS)]
     if not plan_state:
         return (
             *hidden_groups,
             *hidden_headers,
             *hidden_previews,
+            *hidden_details,
             *hidden_decisions,
             *hidden_numbers,
             *hidden_numbers,
             *hidden_numbers,
             *hidden_text,
+            *hidden_text,
+            *hidden_origins,
             *hidden_text,
         )
     preview_paths = {}
@@ -407,17 +418,29 @@ def load_candidate_cards(plan_state):
         plan = orch.status.edit_plan
         segments = list(plan.timeline_segments) if plan else []
         preview_paths = plan_state.get("previews", {}) or orch.preview_paths
+        candidate_by_id = {
+            item.id: item for item in (orch.status.analysis.candidate_clips if orch.status.analysis else [])
+        }
+        requirement_by_id = {
+            item.id: item.description
+            for item in (orch.status.requirement_spec.requirements if orch.status.requirement_spec else [])
+        }
     except Exception:
         segments = []
+        candidate_by_id = {}
+        requirement_by_id = {}
     group_updates = []
     header_updates = []
     preview_updates = []
+    detail_updates = []
     decision_updates = []
     order_updates = []
     start_updates = []
     end_updates = []
     subtitle_updates = []
     title_updates = []
+    origin_updates = []
+    boundary_updates = []
     for index in range(MAX_CANDIDATE_CARDS):
         if index < len(segments):
             segment = segments[index]
@@ -438,33 +461,106 @@ def load_candidate_cards(plan_state):
             preview_updates.append(
                 gr.update(value=preview_path, visible=bool(preview_path))
             )
+            candidate = candidate_by_id.get(segment.candidate_id)
+            if candidate:
+                matched = "；".join(
+                    requirement_by_id.get(item, "任务书中的相关内容")
+                    for item in candidate.matched_requirement_ids
+                )
+                quotes = "\n\n".join(
+                    f"> “{html.escape(item.quote)}”" for item in candidate.citations
+                ) or "暂无转录原文"
+                risk = (
+                    "这段由检索补入以接近目标时长，建议播放后确认。"
+                    if "code_retrieved_review_required" in candidate.risk_flags
+                    else "来源、时间和引用已经过自动核对。"
+                )
+                detail_updates.append(gr.update(value=(
+                    f"**为什么推荐：** {html.escape(candidate.selection_reason)}\n\n"
+                    f"**对应需求：** {html.escape(matched)}\n\n"
+                    f"**可核对原文：**\n\n{quotes}\n\n"
+                    f"**检查提示：** {risk}"
+                )))
+            else:
+                detail_updates.append(gr.update(value="暂无更多说明"))
             decision_updates.append(gr.update(value="keep"))
             order_updates.append(gr.update(value=segment.order))
-            start_updates.append(gr.update(value=round(segment.source_start, 2)))
-            end_updates.append(gr.update(value=round(segment.source_end, 2)))
+            duration_limit = (
+                orch.status.analysis.source_durations.get(segment.source_asset_id or "", orch.status.analysis.video_duration)
+                if orch.status.analysis else segment.source_end
+            )
+            context_start = max(0.0, (candidate.source_start if candidate else segment.source_start) - 5.0)
+            context_end = min(duration_limit, (candidate.source_end if candidate else segment.source_end) + 5.0)
+            start_updates.append(gr.update(value=round(segment.source_start, 2), minimum=context_start, maximum=context_end))
+            end_updates.append(gr.update(value=round(segment.source_end, 2), minimum=context_start, maximum=context_end))
+            origin_updates.append(context_start)
+            boundary_updates.append(gr.update(value=describe_candidate_boundary(
+                plan_state, index + 1, segment.source_start, segment.source_end, context_start,
+            )))
             subtitle_updates.append(gr.update(value=segment.subtitle_text or ""))
             title_updates.append(gr.update(value=segment.title_text or ""))
         else:
             group_updates.append(hidden_groups[index])
             header_updates.append(hidden_headers[index])
             preview_updates.append(hidden_previews[index])
+            detail_updates.append(hidden_details[index])
             decision_updates.append(hidden_decisions[index])
             order_updates.append(hidden_numbers[index])
             start_updates.append(hidden_numbers[index])
             end_updates.append(hidden_numbers[index])
             subtitle_updates.append(hidden_text[index])
             title_updates.append(hidden_text[index])
+            origin_updates.append(0.0)
+            boundary_updates.append(hidden_text[index])
     return (
         *group_updates,
         *header_updates,
         *preview_updates,
+        *detail_updates,
         *decision_updates,
         *order_updates,
         *start_updates,
         *end_updates,
         *subtitle_updates,
         *title_updates,
+        *origin_updates,
+        *boundary_updates,
     )
+
+
+def load_candidate_preview(plan_state, order):
+    """只在用户需要观看时生成这一段，避免进入审核页前长时间等待。"""
+    if not plan_state:
+        raise gr.Error("请先生成剪辑方案")
+    try:
+        orch = _get_task_orchestrator(plan_state)
+        path = orch.create_preview_for_order(int(order), context_seconds=5.0)
+        return gr.update(value=path, visible=True)
+    except Exception as error:
+        raise gr.Error(str(error)) from error
+
+
+def describe_candidate_boundary(plan_state, order, start, end, origin=0.0):
+    """显示拖动位置附近的原话，用户不用猜时间码对应什么内容。"""
+    del origin
+    if float(end) <= float(start):
+        return "⚠️ 结尾必须在开头之后，请调整选段范围。"
+    try:
+        orch = _get_task_orchestrator(plan_state)
+        segment = orch.status.edit_plan.timeline_segments[int(order) - 1]
+        transcript = [item for item in orch.status.analysis.transcript if item.source_asset_id == segment.source_asset_id]
+        def nearby(position):
+            if not transcript:
+                return "以预览画面和声音为准"
+            item = min(transcript, key=lambda item: min(abs(item.start - position), abs(item.end - position)))
+            return html.escape(item.text)
+        return (
+            f"选中 **{float(end) - float(start):.1f} 秒**。拖动后预览会定位到相应画面。\n\n"
+            f"**开头附近：** {nearby(float(start))}\n\n"
+            f"**结尾附近：** {nearby(float(end))}"
+        )
+    except (AttributeError, ValueError, IndexError, KeyError):
+        return f"选中 {float(end) - float(start):.1f} 秒；先加载预览，再拖动调整。"
 
 
 def candidate_cards_to_rows(*values):
@@ -844,30 +940,45 @@ def _clarification_answer_map(orch, modes, answers):
 
 def begin_requirement_generation():
     return (
-        "⏳ 正在预检视频、转录素材并生成需求建议。视频较长时需要几分钟，请不要重复点击。",
-        gr.update(value="⏳ 正在理解需求与素材...", interactive=False),
+        "⏳ 正在检查并转录素材。完成后会直接跳到可编辑的需求确认区，请不要重复点击。",
+        gr.update(value="⏳ 正在读取素材...", interactive=False),
     )
 
 
 def finish_requirement_generation():
     return (
-        "✅ 素材理解与任务书处理结束，请查看第 2 步；如有优化建议，请先选择采用、修改或保持原要求。",
-        gr.update(value="🧾 重新生成需求任务书", interactive=True),
+        "✅ 素材已理解。请在第 2 步统一确认用途、观看者、内容取舍、风格与音乐。",
+        gr.update(value="重新读取素材", interactive=True),
     )
 
 
 def begin_material_analysis():
     return (
-        "⏳ 正在确认任务书，并读取或生成素材转录后检索候选，请不要重复点击。",
-        gr.update(value="⏳ 正在分析素材...", interactive=False),
+        "⏳ 已保存你的答案；正在复用转录、批量检索并生成一版接近目标时长的方案。",
+        gr.update(value="⏳ 正在生成方案...", interactive=False),
     )
 
 
 def finish_material_analysis():
     return (
-        "✅ 素材分析处理结束，请继续查看下方第 3 步的证据、候选片段和时间线。",
-        gr.update(value="✅ 重新确认并分析素材", interactive=True),
+        "✅ 方案已生成。请在第 3 步播放候选并确认，证据详情默认折叠。",
+        gr.update(value="重新生成方案", interactive=True),
     )
+
+
+def reveal_requirement_stage():
+    """素材理解完成后才展开任务书，避免初始页堆满空区域。"""
+    return tuple(gr.update(visible=True) for _ in range(6))
+
+
+def reveal_candidate_stage():
+    """候选生成完成后才展示审核操作。"""
+    return tuple(gr.update(visible=True) for _ in range(4))
+
+
+def reveal_delivery_stage():
+    """完成渲染后才展示成片和编辑器交接区。"""
+    return tuple(gr.update(visible=True) for _ in range(3))
 
 
 def _delivery_markdown(report):
@@ -885,6 +996,7 @@ def _delivery_markdown(report):
         "deterministic": "自动检查",
         "semantic": "语义检查",
         "manual": "人工确认",
+        "human": "人工确认",
     }
     rows = "\n".join(
         f"| {status_labels.get(item.status, item.status)} | "
@@ -916,7 +1028,6 @@ def _review_markdown(orch):
         f"{index}. **{PRIORITY_LABELS.get(item.priority, item.priority)}**：{html.escape(item.description)}"
         for index, item in enumerate(spec.requirements, start=1)
     ) or "- 无"
-    candidate_cards = []
     requirement_by_id = {item.id: item.description for item in spec.requirements}
     generation = {}
     try:
@@ -931,45 +1042,15 @@ def _review_markdown(orch):
         if item_id in requirement_by_id
     ]
     batch_notice = (
-        "> **⚠️ 部分需求的候选分析失败：** "
+        "> **⚠️ AI 排序本次没有完整返回：** "
         + "；".join(html.escape(item) for item in failed_descriptions)
-        + "。其他成功批次仍可审核，失败批次没有使用规则结果冒充 AI 候选。"
+        + "。系统已用来源、时间和原文都可验证的检索结果补足候选；"
+        "这些片段不是冒充 AI 结论，请播放后决定是否保留。"
         if failed_descriptions else ""
     )
     candidate_number_by_id = {}
     for index, candidate in enumerate(analysis.candidate_clips, start=1):
         candidate_number_by_id[candidate.id] = index
-        citations = "\n".join(
-            f"> “{html.escape(citation.quote)}”"
-            for citation in candidate.citations
-        ) or "> 暂无可核验原文（该建议不会进入可导出时间线）"
-        matched = "；".join(
-            html.escape(requirement_by_id.get(item_id, "未匹配到任务书要求"))
-            for item_id in candidate.matched_requirement_ids
-        ) or "无"
-        risks = []
-        for flag in candidate.risk_flags:
-            if flag in {"llm_unavailable", "candidate_generation_fallback"}:
-                risks.append("智能候选生成未完成；此片段由证据检索规则推荐，请重点核对原文和时间范围")
-            elif flag.startswith("evidence_not_retrieved"):
-                risks.append("引用证据未通过检索范围检查")
-            elif flag.startswith("invalid_evidence"):
-                risks.append("引用原文未通过一致性检查")
-            else:
-                risks.append("需要人工复核")
-        risk = "；".join(dict.fromkeys(risks)) or "证据与时间范围已通过自动检查"
-        candidate_cards.append(
-            f"### 片段 {index} · {html.escape(_source_name(orch, candidate.source_asset_id))} · "
-            f"{_format_seconds(candidate.source_start)}–{_format_seconds(candidate.source_end)}\n\n"
-            f"**对应要求：** {matched}\n\n"
-            f"**为什么建议保留：** {html.escape(candidate.selection_reason)}\n\n"
-            f"**可核验原文：**\n\n{citations}\n\n"
-            f"**建议你重点看：** {html.escape(risk)}"
-        )
-    style_lines = "\n".join(
-        f"- 方案 {index}：{html.escape(proposal.rationale)}"
-        for index, proposal in enumerate(orch.status.style_proposals, start=1)
-    ) or "- 无推荐，继续使用基础样式"
     covered_requirements = {
         requirement_id
         for candidate in analysis.candidate_clips
@@ -1032,13 +1113,8 @@ def _review_markdown(orch):
 
 {batch_notice}
 
-### 可选风格建议
-{style_lines}
-
-### 证据与候选
-每个片段都展示对应要求、AI 入选理由和可以回到原素材核对的字幕原文。
-
-{f'{chr(10)}{chr(10)}---{chr(10)}{chr(10)}'.join(candidate_cards)}
+### 候选片段
+已生成 **{len(analysis.candidate_clips)} 个**可审核片段。播放按钮和“为什么推荐与证据”都在下方片段卡片中，默认收起以便快速浏览。
 
 ### 粗剪时间线 v{plan.version}
 | 顺序 | 片段 | 来源素材 | 原素材时间 | 成片时间 | 字幕 |
@@ -1141,48 +1217,84 @@ def _duration_action_markdown(orch):
     if missing_must:
         return (
             f"⚠️ 当前预计 **{plan.estimated_duration:.1f} 秒**，还差约 **{missing_seconds:.1f} 秒**；"
-            "并且仍有必须内容没有进入时间线。请在下方播放原素材并补入对应片段，"
+            "并且仍有必须内容没有进入时间线。先点击“自动补选，接近目标时长”；也可以点击“＋ 自己补入片段”后播放原素材补入对应内容。"
             "必须内容不能通过接受短版跳过。",
             False,
         )
     return (
         f"⚠️ 当前预计 **{plan.estimated_duration:.1f} 秒**，比任务书允许的最低时长 "
         f"**{lower:.1f} 秒**少约 **{missing_seconds:.1f} 秒**。你可以：\n\n"
-        "1. 如果现有内容已经完整，点击“接受当前时长并生成”；系统会记录这次人工例外。\n"
-        "2. 如果还缺内容，直接在下方播放原素材、拖动选段范围并加入时间线。"
+        "1. 点击“自动补选，接近目标时长”，系统从已转录素材中补选，不重复调用 AI。\n"
+        "2. 点击“＋ 自己补入片段”，播放原素材并拖动选段范围。\n"
+        "3. 如果现有内容已经完整，点击“接受当前时长并生成”；系统会记录这次人工例外。"
         f"{recommendation_text}",
         True,
     )
 
 
+def live_review_duration(plan_state, transition, intro, outro, manual_rows, *card_values):
+    """用户删选或拖动边界时立即重算；不能等点击生成才发现时长不足。"""
+    if not plan_state:
+        return gr.update(), gr.update()
+    try:
+        orch = _get_task_orchestrator(plan_state)
+        spec = orch.status.requirement_spec
+        rows = candidate_cards_to_rows(*card_values)
+        selected = [row for row in rows if row[0] and float(row[4]) > float(row[3])]
+        manual = _manual_segment_payloads(manual_rows, spec, len(selected))
+        count = len(selected) + len(manual)
+        seconds = sum(float(row[4]) - float(row[3]) for row in selected)
+        seconds += sum(item["source_end"] - item["source_start"] for item in manual)
+        seconds -= float(transition) * max(0, count - 1)
+        seconds += 2.0 * sum(style != "none" for style in (intro, outro))
+        selected_ids = {plan_state.get("candidate_labels", {}).get(row[2]) for row in selected}
+        covered = {
+            requirement_id for segment in orch.status.edit_plan.timeline_segments
+            if segment.candidate_id in selected_ids for requirement_id in segment.matched_requirement_ids
+        } | {requirement_id for item in manual for requirement_id in item["matched_requirement_ids"]}
+        missing_must = any(item.priority == "must" and item.id not in covered for item in spec.requirements)
+        shortage = max(0, spec.target_duration - seconds)
+        text = f"当前选择 **{count} 段，预计 {seconds:.1f} 秒**；目标 **{spec.target_duration:.0f} 秒**（已扣除转场重叠）。"
+        if shortage > spec.duration_tolerance:
+            text += f"\n\n还差约 **{shortage:.1f} 秒**。点击“自动补选，接近目标时长”，或“＋ 自己补入片段”。"
+        elif seconds > spec.target_duration + spec.duration_tolerance:
+            text += "\n\n当前超过允许时长，可以删除一段或拖动边界缩短。"
+        else:
+            text += "\n\n✅ 当前时长在任务书允许范围内。"
+        if missing_must:
+            text += "\n\n⚠️ 有必须内容未保留，请补选对应内容。"
+        return text, gr.update(visible=bool(count and shortage > spec.duration_tolerance and not missing_must))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return gr.update(), gr.update()
+
+
 def create_requirement_review(
-    video_path, user_input, scenario, target_duration, style, keywords, need_subtitles,
-    progress=gr.Progress(),
+    video_path, user_input, scenario, target_duration, progress=gr.Progress(),
 ):
     """生成初步任务书、素材转录和对齐建议；候选分析仍等待用户确认。"""
     video_paths = _uploaded_video_paths(video_path)
     if not video_paths:
         return (
             "请先上传视频文件", None,
-            *[gr.update() for _ in range(8)],
+            *[gr.update() for _ in range(12)],
         )
 
     if not user_input or not user_input.strip():
-        user_input = "帮我把这个视频剪成3分钟精彩集锦"
+        user_input = "请根据素材整理一版可审核的剪辑方案"
 
     progress(0.0, desc="启动中...")
 
     try:
         orch = _new_task_orchestrator()
 
-        progress(0.1, desc="正在理解需求并预检视频...")
-        style_map = {"正式": "formal", "燃向": "exciting", "温馨": "warm", "轻松": "funny"}
-        overrides = {
-            "target_duration": int(target_duration),
-            "style": style_map.get(style),
-            "focus_keywords": [word.strip() for word in keywords.split(",") if word.strip()],
-            "need_subtitles": need_subtitles,
-        }
+        progress(0.08, desc="正在检查视频...")
+        # 大白话描述里已经写了时长时，以用户的话为准；滑块只是没有写时长时的默认值。
+        duration_is_explicit = bool(
+            re.search(r"\d+(?:\.\d+)?\s*(?:分(?:钟|半)?|秒|s\b)", user_input, re.I)
+        )
+        overrides = (
+            {} if duration_is_explicit else {"target_duration": int(target_duration)}
+        )
         scenario_value = "school" if scenario == "学校活动" else "enterprise"
         compilation = orch.create_requirement_draft(
             video_paths,
@@ -1190,15 +1302,16 @@ def create_requirement_review(
             scenario=scenario_value,
             overrides=overrides,
             submitted_by="local-user",
+            progress_callback=lambda fraction, message: progress(
+                0.10 + 0.75 * fraction, desc=message
+            ),
         )
         task_id = orch.task_dir.name
         _task_orchestrators[task_id] = orch
         spec = compilation.spec
         proposal = compilation.alignment_proposal
-        needs_alignment_decision = bool(
-            proposal is not None and proposal.requires_user_decision
-        )
-        progress(1.0, desc="请审核需求任务书")
+        needs_alignment_decision = False
+        progress(1.0, desc="素材已转录，请确认需求和 AI 提问")
         summary = _requirement_review_markdown(
             spec,
             compilation.execution_brief,
@@ -1213,25 +1326,66 @@ def create_requirement_review(
                 "source_count": len(video_paths),
                 "gate_id": orch.status.requirement_gate.id,
             },
-            gr.update(visible=not needs_alignment_decision),
+            gr.update(visible=True),
             gr.update(value=_requirement_rows(spec), visible=True),
-            gr.update(value=spec.purpose, visible=True),
-            gr.update(value=spec.audience, visible=True),
-            gr.update(visible=not needs_alignment_decision),
+            gr.update(value=_editable_requirement_value(spec.purpose), visible=True),
+            gr.update(value=_editable_requirement_value(spec.audience), visible=True),
+            gr.update(value={
+                "formal": "正式", "exciting": "燃向", "warm": "温馨",
+                "funny": "轻松", "general": "自然清晰",
+            }.get(spec.style, "自然清晰"), visible=True),
+            gr.update(value=spec.need_subtitles, visible=True),
+            gr.update(value=spec.need_bgm, visible=True),
+            gr.update(visible=False),
             gr.update(visible=needs_alignment_decision),
             gr.update(value=_material_alignment_markdown(proposal)),
             gr.update(
                 value=(proposal.suggested_requirement_text if proposal else ""),
                 visible=needs_alignment_decision,
             ),
+            gr.update(value=spec.target_duration),
         )
 
     except Exception as e:
         progress(1.0, desc="出错")
         return (
             f"## 错误\n\n{html.escape(str(e))}", None,
-            *[gr.update() for _ in range(8)],
+            *[gr.update() for _ in range(12)],
         )
+
+
+def _parse_requirement_rows(requirement_rows, existing):
+    """把用户可读表格转换为任务书条目，不暴露内部 ID。"""
+    items = []
+    for row in requirement_rows or []:
+        if not row or len(row) < 3 or not str(row[2]).strip():
+            continue
+        try:
+            row_number = int(float(row[0])) if row[0] not in {None, ""} else 0
+        except (TypeError, ValueError):
+            row_number = 0
+        old = existing[row_number - 1] if 1 <= row_number <= len(existing) else None
+        priority = PRIORITY_VALUES.get(str(row[1]).strip())
+        if priority is None:
+            raise ValueError("重要程度请填写：必须保留、建议保留、可有可无或禁止出现")
+        acceptance = str(row[3]).strip() if len(row) > 3 and row[3] else None
+        if priority in {"must", "prohibited"} and not acceptance:
+            acceptance = (
+                "成片中至少有一个已确认片段覆盖该要求"
+                if priority == "must"
+                else "最终候选和时间线不得包含该内容"
+            )
+        items.append({
+            "id": old.id if old else None,
+            "category": old.category if old else "content",
+            "priority": priority,
+            "description": str(row[2]).strip(),
+            "acceptance_rule": acceptance,
+            "status": "confirmed",
+        })
+    if not items:
+        raise ValueError("请至少保留一条内容要求")
+    return items
 
 
 def revise_requirement_review(
@@ -1244,27 +1398,7 @@ def revise_requirement_review(
     try:
         orch = _get_task_orchestrator(workflow_state)
         existing = list(orch.status.requirement_spec.requirements)
-        items = []
-        for row in requirement_rows or []:
-            if not row or len(row) < 3 or not str(row[2]).strip():
-                continue
-            try:
-                row_number = int(float(row[0])) if row[0] not in {None, ""} else 0
-            except (TypeError, ValueError):
-                row_number = 0
-            old = existing[row_number - 1] if 1 <= row_number <= len(existing) else None
-            priority_label = str(row[1]).strip()
-            priority = PRIORITY_VALUES.get(priority_label)
-            if priority is None:
-                raise ValueError("重要程度请填写：必须保留、建议保留、可有可无或禁止出现")
-            items.append({
-                "id": old.id if old else None,
-                "category": old.category if old else "content",
-                "priority": priority,
-                "description": str(row[2]).strip(),
-                "acceptance_rule": str(row[3]).strip() if len(row) > 3 and row[3] else None,
-                "status": "confirmed",
-            })
+        items = _parse_requirement_rows(requirement_rows, existing)
         style_map = {"正式": "formal", "燃向": "exciting", "温馨": "warm", "轻松": "funny"}
         revised = orch.revise_requirement_draft(
             updates={
@@ -1288,8 +1422,8 @@ def revise_requirement_review(
                 saved=True,
             ),
             workflow_state,
-            gr.update(value=revised.purpose, visible=True),
-            gr.update(value=revised.audience, visible=True),
+            gr.update(value=_editable_requirement_value(revised.purpose), visible=True),
+            gr.update(value=_editable_requirement_value(revised.audience), visible=True),
             gr.update(value=_requirement_rows(revised), visible=True),
         )
     except Exception as error:
@@ -1298,7 +1432,14 @@ def revise_requirement_review(
 
 def confirm_and_analyze(
     workflow_state,
-    clarification_confirmations,
+    purpose,
+    audience,
+    target_duration,
+    style,
+    need_subtitles,
+    need_bgm,
+    bgm_path,
+    requirement_rows,
     allow_confirmed_override=False,
     mode_1="ignore", answer_1="",
     mode_2="ignore", answer_2="",
@@ -1315,14 +1456,37 @@ def confirm_and_analyze(
         )
     try:
         orch = _get_task_orchestrator(workflow_state)
+        current_spec = orch.status.requirement_spec
+        if not str(purpose or "").strip() or str(purpose).strip() == "待你确认":
+            raise ValueError("请填写这支视频的用途")
+        if not str(audience or "").strip() or str(audience).strip() == "待你确认":
+            raise ValueError("请填写主要观看者")
+        items = _parse_requirement_rows(
+            requirement_rows, list(current_spec.requirements)
+        )
+        style_map = {
+            "自然清晰": "general", "正式": "formal", "燃向": "exciting",
+            "温馨": "warm", "轻松": "funny",
+        }
+        progress(0.03, desc="正在保存你确认的需求...")
+        orch.revise_requirement_draft(
+            updates={
+                "purpose": str(purpose).strip(),
+                "audience": str(audience).strip(),
+                "target_duration": float(target_duration),
+                "style": style_map.get(style, "general"),
+                "need_subtitles": bool(need_subtitles),
+                "need_bgm": bool(need_bgm or bgm_path),
+            },
+            requirements=items,
+            actor_id="local-user",
+        )
+        workflow_state = {
+            **workflow_state,
+            "gate_id": orch.status.requirement_gate.id,
+        }
         clarification_modes = [mode_1, mode_2, mode_3, mode_4, mode_5]
         clarification_texts = [answer_1, answer_2, answer_3, answer_4, answer_5]
-        _validate_clarification_confirmations(
-            orch,
-            clarification_confirmations,
-            clarification_modes,
-            clarification_texts,
-        )
         clarification_answers = _clarification_answer_map(
             orch,
             clarification_modes,
@@ -1335,8 +1499,10 @@ def confirm_and_analyze(
             clarification_answers=clarification_answers,
             allow_confirmed_override=bool(allow_confirmed_override),
         )
-        progress(0.15, desc="正在转录并检索证据...")
-        script = orch.analyze_confirmed_requirement(workflow_state["video_path"], generate_previews=True)
+        progress(0.20, desc="转录已复用，正在一次性检索和排序候选...")
+        script = orch.analyze_confirmed_requirement(
+            workflow_state["video_path"], generate_previews=False
+        )
         if not script.operations:
             return (
                 _candidate_failure_markdown(orch),
@@ -1352,7 +1518,7 @@ def confirm_and_analyze(
             **workflow_state,
             "plan_id": orch.status.edit_plan.id,
             "plan_version": orch.status.edit_plan.version,
-            "previews": orch.preview_paths,
+            "previews": {},
             "candidate_labels": _candidate_label_map(orch.status.edit_plan),
         }
         style_choices = [
@@ -1462,6 +1628,54 @@ def _revise_plan_from_review_controls(
         actor_id="local-user",
     )
     return orch, revised
+
+
+def fill_duration_from_controls(
+    plan_state, timeline_rows, manual_segment_rows, style_bundle_id,
+    bgm_path, bgm_volume, transition_duration, subtitle_style,
+    intro_style, outro_style, title_text,
+):
+    """保留本页修改后自动补选；新增内容仍留在审核页，不会直接出片。"""
+    try:
+        orch = _get_task_orchestrator(plan_state)
+        excluded = list(plan_state.get("excluded_ranges", []))
+        label_map = plan_state.get("candidate_labels", {})
+        by_id = {item.candidate_id: item for item in orch.status.edit_plan.timeline_segments}
+        for row in timeline_rows or []:
+            if len(row) < 3 or _truthy(row[0]):
+                continue
+            segment = by_id.get(label_map.get(str(row[2]).strip()))
+            if segment:
+                excluded.append({
+                    "source_asset_id": segment.source_asset_id,
+                    "start": segment.source_start, "end": segment.source_end,
+                })
+        orch, before = _revise_plan_from_review_controls(
+            plan_state, timeline_rows, manual_segment_rows, style_bundle_id,
+            bgm_path, bgm_volume, transition_duration, subtitle_style,
+            intro_style, outro_style, title_text,
+        )
+        revised = orch.supplement_plan_duration(
+            excluded_ranges=excluded, actor_id="local-user"
+        )
+        state = {
+            **plan_state, "plan_version": revised.version, "previews": {},
+            "candidate_labels": _candidate_label_map(revised), "excluded_ranges": excluded,
+        }
+        text, accept_short = _duration_action_markdown(orch)
+        added = len(revised.timeline_segments) - len(before.timeline_segments)
+        notice = (
+            f"✅ 已补选 {added} 段，请在下方查看新增片段。原有删选、顺序与字幕修改已保留。"
+            if added > 0 else
+            "本轮没有找到可直接追加且不重复的完整片段。系统不会恢复你删除的内容或重复画面凑时长；可以手动补片、减少内容限制或接受短版。"
+        )
+        return (
+            _review_markdown(orch), _timeline_rows(revised), state,
+            notice + "\n\n" + text, gr.update(visible=accept_short), [],
+            _manual_segments_markdown([]),
+        )
+    except Exception as error:
+        raise gr.Error(str(error)) from error
 
 
 def render_confirmed(
@@ -2244,8 +2458,8 @@ def create_ui():
                 )
             with gr.Column(scale=7, elem_classes=["intake-column"]):
                 user_input = gr.Textbox(
-                    label="你希望剪成什么样？",
-                    placeholder="例如：帮我把运动会视频剪成3分钟精彩集锦，重点要冲刺和颁奖的画面",
+                    label="简单说一句目标（可选）",
+                    placeholder="例如：剪成约 3 分钟的精华版",
                     lines=3,
                 )
                 with gr.Row():
@@ -2261,21 +2475,8 @@ def create_ui():
                         step=30,
                         label="目标时长（秒）",
                     )
-                keywords = gr.Textbox(
-                    label="重点内容（可选）",
-                    placeholder="例如：冲刺，颁奖，领导讲话",
-                )
-                gr.Markdown("快捷填写", elem_classes=["template-label"])
-                gr.Examples(
-                    examples=[
-                        ["帮我把运动会视频剪成3分钟精彩集锦"],
-                        ["把知识竞赛的精彩回答剪出来，5分钟以内"],
-                        ["会议录像太长，剪一个3分钟的精华版"],
-                    ],
-                    inputs=user_input,
-                )
                 submit_btn = gr.Button(
-                    "生成需求任务书",
+                    "理解素材并整理需求",
                     variant="primary",
                     size="lg",
                     elem_classes=["primary-action"],
@@ -2286,15 +2487,17 @@ def create_ui():
                 )
 
         plan_state = gr.State(value=None)
-        gr.Markdown(
+        requirement_heading = gr.Markdown(
             """
             <div class="step-heading"><span class="step-index">02</span><div><div class="step-title">确认任务书与执行依据</div><div class="step-description">检查 AI 是否准确理解用途、受众和必须保留的内容，确认后才会分析素材。</div></div></div>
             """,
             elem_classes=["workflow-heading"],
+            visible=False,
         )
         requirement_result_text = gr.Markdown(
             value="等待上传视频并生成任务书...",
             elem_id="requirement-review",
+            visible=False,
         )
 
         with gr.Group(visible=False, elem_classes=["alignment-card"]) as alignment_group:
@@ -2331,10 +2534,11 @@ def create_ui():
                     lines=2,
                     visible=False,
                 )
-                confirm_question_btn = gr.Button("确认本题", variant="secondary")
+                confirm_question_btn = gr.Button("确认本题", variant="secondary", visible=False)
                 question_confirmation_status = gr.Markdown(
-                    "请选择后确认本题。",
+                    "",
                     elem_classes=["action-status"],
+                    visible=False,
                 )
                 clarification_groups.append(question_group)
                 clarification_modes.append(mode)
@@ -2349,15 +2553,39 @@ def create_ui():
         )
         with gr.Row():
             purpose_editor = gr.Textbox(
-                label="成片用途",
+                label="成片用途（必填）",
                 placeholder="例如：学校运动会公众号回顾",
                 visible=False,
             )
             audience_editor = gr.Textbox(
-                label="观看对象",
+                label="观看对象（必填）",
                 placeholder="例如：师生与家长",
                 visible=False,
             )
+        with gr.Row():
+            style = gr.Dropdown(
+                choices=["自然清晰", "正式", "燃向", "温馨", "轻松"],
+                value="自然清晰",
+                label="整体感觉",
+                info="AI 会给出初始建议，你可以直接改。",
+                visible=False,
+            )
+            need_subtitles = gr.Checkbox(
+                value=True,
+                label="生成中文字幕",
+                visible=False,
+            )
+            need_bgm = gr.Checkbox(
+                value=False,
+                label="添加背景音乐",
+                visible=False,
+            )
+        bgm_input = gr.Audio(
+            label="上传背景音乐（可选；请确认拥有使用权）",
+            sources=["upload"],
+            type="filepath",
+            visible=False,
+        )
         requirement_editor = gr.Dataframe(
             headers=["序号", "重要程度", "要求内容", "如何验收"],
             datatype=["number", "str", "str", "str"],
@@ -2372,16 +2600,21 @@ def create_ui():
         with gr.Row():
             revise_requirement_btn = gr.Button("💾 保存任务书修改", visible=False)
             confirm_requirement_btn = gr.Button(
-                "✅ 确认任务书并分析素材",
+                "✅ 确认这些需求并生成方案",
                 variant="primary",
                 visible=False,
             )
         analysis_action_status = gr.Markdown(
             "确认任务书后，这里会持续提示素材分析状态。",
             elem_classes=["action-status"],
+            visible=False,
         )
 
-        with gr.Accordion("📎 活动流程表、名单与术语资料（可选）", open=False):
+        with gr.Accordion(
+            "📎 活动流程表、名单与术语资料（可选）",
+            open=False,
+            visible=False,
+        ) as reference_accordion:
             gr.Markdown(
                 "可在任务书确认前上传。资料会保留行或单元格出处，只用于检索和生成待确认建议。"
             )
@@ -2402,14 +2635,12 @@ def create_ui():
             add_reference_btn = gr.Button("加入本次任务的参考资料")
             reference_status = gr.Markdown("尚未上传活动资料。")
 
-        with gr.Accordion("🎨 成品样式与声音（确认任务书后可调整）", open=False):
-            gr.Markdown("这些设置只影响最终成片，不会遮挡或改变上方任务书。")
-            style = gr.Dropdown(
-                choices=["自动判断", "正式", "燃向", "温馨", "轻松"],
-                value="自动判断",
-                label="剪辑风格",
-            )
-            need_subtitles = gr.Checkbox(value=True, label="烧录中文字幕")
+        with gr.Accordion(
+            "🎨 高级：片头、字幕外观与声音细节",
+            open=False,
+            visible=False,
+        ) as advanced_style_accordion:
+            gr.Markdown("任务书中的整体感觉和是否添加字幕、音乐已在上方确认；这里只调表现细节。")
             subtitle_style = gr.Radio(
                 choices=[("经典白字", "classic"), ("简洁白字", "clean"), ("醒目黄字", "highlight")],
                 value="classic",
@@ -2430,11 +2661,6 @@ def create_ui():
                     value="none",
                     label="片尾",
                 )
-            bgm_input = gr.Audio(
-                label="背景音乐（可选）",
-                sources=["upload"],
-                type="filepath",
-            )
             bgm_volume = gr.Slider(
                 minimum=0.0,
                 maximum=0.5,
@@ -2443,28 +2669,39 @@ def create_ui():
                 label="背景音乐音量",
             )
 
-        gr.Markdown(
+        candidate_heading = gr.Markdown(
             """
             <div class="step-heading"><span class="step-index">03</span><div><div class="step-title">审核候选片段与时间线</div><div class="step-description">边看片段、边看依据；保留、删除、排序和补片都在这里完成。</div></div></div>
             """,
             elem_classes=["workflow-heading"],
+            visible=False,
         )
         candidate_result_text = gr.Markdown(
             value="等待确认任务书并分析素材...",
             elem_id="review-output",
+            visible=False,
         )
         with gr.Group(visible=False, elem_classes=["duration-decision-card"]) as duration_action_group:
             duration_action_text = gr.Markdown()
+            with gr.Row():
+                autofill_duration_btn = gr.Button("自动补选，接近目标时长", variant="primary")
+                open_manual_btn = gr.Button("＋ 自己补入片段")
             accept_short_btn = gr.Button(
                 "✅ 接受当前时长并生成成片",
                 variant="secondary",
                 size="lg",
                 visible=False,
             )
-        with gr.Group(visible=False, elem_classes=["manual-add-card"]) as manual_segment_group:
+        with gr.Accordion(
+            "从原素材补入片段（可选）",
+            open=False,
+            visible=False,
+            elem_classes=["manual-add-card"],
+            elem_id="manual-add",
+        ) as manual_segment_group:
             gr.Markdown(
-                "### ➕ 从原素材补入片段\n\n"
-                "播放原视频定位内容，再拖动开始和结束滑块选择范围；不需要手写时间。"
+                "只有现有方案缺少特定内容时才需要使用。播放原视频定位内容，"
+                "再拖动开始和结束滑块选择范围；不需要手写时间。"
             )
             manual_source_selector = gr.Dropdown(
                 choices=[],
@@ -2525,20 +2762,31 @@ def create_ui():
             ],
             value=0.35,
             label="片段之间怎么衔接？",
+            visible=False,
         )
         timeline_state = gr.State(value=[])
         candidate_groups = []
         candidate_headers = []
         candidate_previews = []
+        candidate_details = []
+        candidate_preview_buttons = []
+        candidate_preview_orders = []
         candidate_decisions = []
         candidate_orders = []
         candidate_starts = []
         candidate_ends = []
         candidate_subtitles = []
         candidate_titles = []
+        candidate_context_origins = []
+        candidate_boundary_statuses = []
+        candidate_mark_starts = []
+        candidate_mark_ends = []
+        candidate_play_ranges = []
         for index in range(MAX_CANDIDATE_CARDS):
             with gr.Group(visible=False, elem_classes=["candidate-edit-card"]) as candidate_group:
                 candidate_header = gr.Markdown()
+                with gr.Accordion("为什么推荐与证据", open=False):
+                    candidate_detail = gr.Markdown()
                 with gr.Row(equal_height=False):
                     with gr.Column(scale=3):
                         with gr.Row():
@@ -2552,11 +2800,11 @@ def create_ui():
                                 precision=0,
                                 label="在成片中的顺序",
                             )
-                        with gr.Accordion("高级：微调片段边界", open=False):
-                            gr.Markdown("通常无需修改；只有预览多出或缺少一句话时再调整。")
-                            with gr.Row():
-                                candidate_start = gr.Number(label="开始位置（秒）", precision=2)
-                                candidate_end = gr.Number(label="结束位置（秒）", precision=2)
+                        with gr.Accordion("看着画面调整开头和结尾", open=False):
+                            gr.Markdown("先加载右侧预览，再拖动滑块；画面会同步定位。也可以暂停在想要的画面，用右侧按钮设为剪辑点。")
+                            candidate_start = gr.Slider(minimum=0, maximum=1, value=0, step=0.1, label="拖动调整开头")
+                            candidate_end = gr.Slider(minimum=0, maximum=1, value=1, step=0.1, label="拖动调整结尾")
+                            candidate_boundary_status = gr.Markdown()
                         candidate_subtitle = gr.Textbox(
                             label="字幕",
                             placeholder="留空则沿用语音识别字幕；需要纠错时直接填写。",
@@ -2567,22 +2815,47 @@ def create_ui():
                             placeholder="例如：校长致辞、颁奖时刻",
                         )
                     with gr.Column(scale=2, min_width=320):
+                        candidate_preview_button = gr.Button("加载片段预览与边界")
                         candidate_preview = gr.Video(
-                            label=f"片段 {index + 1} 预览",
+                            label=f"片段 {index + 1}（含前后 5 秒，便于微调）",
                             autoplay=False,
                             visible=False,
                             elem_classes=["candidate-preview"],
+                            elem_id=f"candidate-video-{index}",
                         )
+                        candidate_play_range = gr.Button("播放选中部分")
+                        with gr.Row():
+                            candidate_mark_start = gr.Button("当前画面设为开头")
+                            candidate_mark_end = gr.Button("当前画面设为结尾")
+                        # 该值也供浏览器定位播放器使用，不能用仅保存在服务端的 gr.State。
+                        candidate_context_origin = gr.Number(value=0.0, visible=False)
                 candidate_groups.append(candidate_group)
                 candidate_headers.append(candidate_header)
                 candidate_previews.append(candidate_preview)
+                candidate_details.append(candidate_detail)
+                candidate_preview_buttons.append(candidate_preview_button)
+                candidate_preview_orders.append(gr.State(value=index + 1))
                 candidate_decisions.append(candidate_decision)
                 candidate_orders.append(candidate_order)
                 candidate_starts.append(candidate_start)
                 candidate_ends.append(candidate_end)
                 candidate_subtitles.append(candidate_subtitle)
                 candidate_titles.append(candidate_title)
-        with gr.Group(elem_classes=["export-action"]):
+                candidate_context_origins.append(candidate_context_origin)
+                candidate_boundary_statuses.append(candidate_boundary_status)
+                candidate_mark_starts.append(candidate_mark_start)
+                candidate_mark_ends.append(candidate_mark_end)
+                candidate_play_ranges.append(candidate_play_range)
+        candidate_card_outputs = [
+            *candidate_groups, *candidate_headers, *candidate_previews, *candidate_details,
+            *candidate_decisions, *candidate_orders, *candidate_starts, *candidate_ends,
+            *candidate_subtitles, *candidate_titles, *candidate_context_origins,
+            *candidate_boundary_statuses,
+        ]
+        with gr.Group(
+            visible=False,
+            elem_classes=["export-action"],
+        ) as candidate_export_group:
             gr.Markdown("**确认候选、时间线和样式后生成成片。系统会保存审核版本，并在导出后逐项验收。**")
             export_btn = gr.Button(
                 "确认方案并生成成片",
@@ -2615,13 +2888,18 @@ def create_ui():
                     height=220,
                 )
 
-        gr.Markdown(
+        delivery_heading = gr.Markdown(
             """
             <div class="step-heading"><span class="step-index">04</span><div><div class="step-title">查看成片与逐项验收</div><div class="step-description">最终视频和验收结论并排呈现；有异常时可以返回修改或记录例外。</div></div></div>
             """,
             elem_classes=["workflow-heading"],
+            visible=False,
         )
-        with gr.Row(equal_height=False, elem_classes=["delivery-panel"]):
+        with gr.Row(
+            equal_height=False,
+            visible=False,
+            elem_classes=["delivery-panel"],
+        ) as delivery_panel:
             with gr.Column(scale=5):
                 delivery_result_text = gr.Markdown(value="等待生成成片...")
                 exception_reason = gr.Textbox(
@@ -2644,7 +2922,10 @@ def create_ui():
                     visible=False,
                 )
 
-        with gr.Group(elem_classes=["export-action"]):
+        with gr.Group(
+            visible=False,
+            elem_classes=["export-action"],
+        ) as editor_export_group:
             gr.Markdown(
                 "### 交给其他剪辑软件继续精修\n"
                 "剪映使用稳定交接包；Premiere、Resolve 等可从 OTIO 继续转换。"
@@ -2662,6 +2943,26 @@ def create_ui():
         )
 
         # 绑定事件
+        review_card_inputs = [component for fields in zip(
+            candidate_decisions, candidate_orders, candidate_starts,
+            candidate_ends, candidate_subtitles, candidate_titles,
+        ) for component in fields]
+        live_duration_inputs = [
+            plan_state, transition_duration, intro_style, outro_style,
+            manual_segment_editor, *review_card_inputs,
+        ]
+        for component in [
+            *candidate_decisions, *candidate_starts, *candidate_ends,
+            transition_duration, intro_style, outro_style,
+        ]:
+            component.input(
+                fn=live_review_duration, inputs=live_duration_inputs,
+                outputs=[duration_action_text, accept_short_btn], queue=False, api_name=False,
+            )
+        manual_segment_editor.change(
+            fn=live_review_duration, inputs=live_duration_inputs,
+            outputs=[duration_action_text, accept_short_btn], queue=False, api_name=False,
+        )
         submit_started = submit_btn.click(
             fn=begin_requirement_generation,
             inputs=[],
@@ -2671,7 +2972,7 @@ def create_ui():
         )
         submit_completed = submit_started.then(
             fn=create_requirement_review,
-            inputs=[video_input, user_input, scenario, target_duration, style, keywords, need_subtitles],
+            inputs=[video_input, user_input, scenario, target_duration],
             outputs=[
                 requirement_result_text,
                 plan_state,
@@ -2679,11 +2980,29 @@ def create_ui():
                 requirement_editor,
                 purpose_editor,
                 audience_editor,
+                style,
+                need_subtitles,
+                need_bgm,
                 revise_requirement_btn,
                 alignment_group,
                 alignment_result_text,
                 alignment_editor,
+                target_duration,
             ],
+            api_name=False,
+        )
+        submit_completed.then(
+            fn=reveal_requirement_stage,
+            inputs=[],
+            outputs=[
+                requirement_heading,
+                requirement_result_text,
+                bgm_input,
+                analysis_action_status,
+                reference_accordion,
+                advanced_style_accordion,
+            ],
+            queue=False,
             api_name=False,
         )
         questions_loaded = submit_completed.then(
@@ -2821,7 +3140,14 @@ def create_ui():
             fn=confirm_and_analyze,
             inputs=[
                 plan_state,
-                clarification_confirmation_state,
+                purpose_editor,
+                audience_editor,
+                target_duration,
+                style,
+                need_subtitles,
+                need_bgm,
+                bgm_input,
+                requirement_editor,
                 clarification_override,
                 *[
                     component
@@ -2852,17 +3178,7 @@ def create_ui():
         candidate_cards_loaded = analysis_completed.then(
             fn=load_candidate_cards,
             inputs=[plan_state],
-            outputs=[
-                *candidate_groups,
-                *candidate_headers,
-                *candidate_previews,
-                *candidate_decisions,
-                *candidate_orders,
-                *candidate_starts,
-                *candidate_ends,
-                *candidate_subtitles,
-                *candidate_titles,
-            ],
+            outputs=candidate_card_outputs,
             api_name=False,
         )
         candidate_cards_loaded.then(
@@ -2870,6 +3186,113 @@ def create_ui():
             inputs=[],
             outputs=[analysis_action_status, confirm_requirement_btn],
             queue=False,
+            api_name=False,
+        )
+        candidate_cards_loaded.then(
+            fn=reveal_candidate_stage,
+            inputs=[],
+            outputs=[
+                candidate_heading,
+                candidate_result_text,
+                transition_duration,
+                candidate_export_group,
+            ],
+            queue=False,
+            api_name=False,
+        )
+        for index in range(MAX_CANDIDATE_CARDS):
+            candidate_preview_buttons[index].click(
+                fn=load_candidate_preview,
+                inputs=[plan_state, candidate_preview_orders[index]],
+                outputs=[candidate_previews[index]],
+                api_name=False,
+            )
+            boundary_inputs = [
+                plan_state, candidate_preview_orders[index], candidate_starts[index],
+                candidate_ends[index], candidate_context_origins[index],
+            ]
+            for component, position in (
+                (candidate_starts[index], "start - origin"),
+                (candidate_ends[index], "end - origin - 0.15"),
+            ):
+                seek_js = """(state, order, start, end, origin) => {
+                    const video = document.querySelector('#candidate-video-__INDEX__ video');
+                    if (video) { video.pause(); video.currentTime = Math.max(0, __POSITION__); }
+                    return [state, order, start, end, origin];
+                }""".replace("__INDEX__", str(index)).replace("__POSITION__", position)
+                component.input(
+                    fn=describe_candidate_boundary, inputs=boundary_inputs,
+                    outputs=[candidate_boundary_statuses[index]], js=seek_js,
+                    queue=False, api_name=False,
+                )
+            for button, output in (
+                (candidate_mark_starts[index], candidate_starts[index]),
+                (candidate_mark_ends[index], candidate_ends[index]),
+            ):
+                marked = button.click(
+                    fn=lambda origin, position: position,
+                    inputs=[candidate_context_origins[index], output], outputs=[output],
+                    js="""(origin, current) => {
+                        const video = document.querySelector('#candidate-video-__INDEX__ video');
+                        const range = video?.closest('.candidate-edit-card')?.querySelector('input[type="range"]');
+                        let position = video ? Math.round((origin + video.currentTime) * 100) / 100 : current;
+                        if (range) position = Math.max(Number(range.min), Math.min(Number(range.max), position));
+                        return [origin, position];
+                    }""".replace("__INDEX__", str(index)),
+                    queue=False, api_name=False,
+                )
+                marked.then(
+                    fn=describe_candidate_boundary, inputs=boundary_inputs,
+                    outputs=[candidate_boundary_statuses[index]], queue=False, api_name=False,
+                )
+                marked.then(
+                    fn=live_review_duration, inputs=live_duration_inputs,
+                    outputs=[duration_action_text, accept_short_btn], queue=False, api_name=False,
+                )
+            candidate_play_ranges[index].click(
+                fn=None,
+                inputs=[candidate_starts[index], candidate_ends[index], candidate_context_origins[index]],
+                outputs=[],
+                js="""(start, end, origin) => {
+                    const video = document.querySelector('#candidate-video-__INDEX__ video');
+                    if (video && end > start) {
+                        video.currentTime = Math.max(0, start - origin);
+                        video.ontimeupdate = () => {
+                            if (video.currentTime >= end - origin) { video.pause(); video.ontimeupdate = null; }
+                        };
+                        video.play().catch(() => {});
+                    }
+                    return [];
+                }""".replace("__INDEX__", str(index)),
+                queue=False, api_name=False,
+            )
+        open_manual_btn.click(
+            fn=lambda: gr.update(visible=True, open=True),
+            inputs=[], outputs=[manual_segment_group], queue=False, api_name=False,
+        )
+        autofill_rows = autofill_duration_btn.click(
+            fn=candidate_cards_to_rows,
+            inputs=[component for fields in zip(
+                candidate_decisions, candidate_orders, candidate_starts,
+                candidate_ends, candidate_subtitles, candidate_titles,
+            ) for component in fields],
+            outputs=[timeline_state], queue=False, api_name=False,
+        )
+        autofill_completed = autofill_rows.then(
+            fn=fill_duration_from_controls,
+            inputs=[
+                plan_state, timeline_state, manual_segment_editor, style_proposal_selector,
+                bgm_input, bgm_volume, transition_duration, subtitle_style,
+                intro_style, outro_style, title_text,
+            ],
+            outputs=[
+                candidate_result_text, timeline_state, plan_state, duration_action_text,
+                accept_short_btn, manual_segment_editor, manual_segment_summary,
+            ],
+            api_name=False,
+        )
+        autofill_completed.then(
+            fn=load_candidate_cards, inputs=[plan_state], outputs=candidate_card_outputs,
             api_name=False,
         )
         for range_component in (manual_range_start, manual_range_end):
@@ -2929,7 +3352,7 @@ def create_ui():
             queue=False,
             api_name=False,
         )
-        candidate_rows_collected.then(
+        render_completed = candidate_rows_collected.then(
             fn=render_confirmed,
             inputs=[
                 plan_state,
@@ -2951,6 +3374,13 @@ def create_ui():
                 exception_reason,
                 approve_exception_btn,
             ],
+            api_name=False,
+        )
+        render_completed.then(
+            fn=reveal_delivery_stage,
+            inputs=[],
+            outputs=[delivery_heading, delivery_panel, editor_export_group],
+            queue=False,
             api_name=False,
         )
         mobile_candidate_rows_collected = create_mobile_review_btn.click(
@@ -2990,7 +3420,7 @@ def create_ui():
             outputs=[mobile_review_status, mobile_review_qr, plan_state],
             api_name=False,
         )
-        apply_mobile_review_btn.click(
+        mobile_render_completed = apply_mobile_review_btn.click(
             fn=apply_mobile_review_and_render,
             inputs=[plan_state],
             outputs=[
@@ -3000,6 +3430,13 @@ def create_ui():
                 exception_reason,
                 approve_exception_btn,
             ],
+            api_name=False,
+        )
+        mobile_render_completed.then(
+            fn=reveal_delivery_stage,
+            inputs=[],
+            outputs=[delivery_heading, delivery_panel, editor_export_group],
+            queue=False,
             api_name=False,
         )
         revoke_mobile_review_btn.click(
@@ -3027,7 +3464,7 @@ def create_ui():
             queue=False,
             api_name=False,
         )
-        short_candidate_rows_collected.then(
+        short_render_completed = short_candidate_rows_collected.then(
             fn=render_short_confirmed,
             inputs=[
                 plan_state,
@@ -3049,6 +3486,13 @@ def create_ui():
                 exception_reason,
                 approve_exception_btn,
             ],
+            api_name=False,
+        )
+        short_render_completed.then(
+            fn=reveal_delivery_stage,
+            inputs=[],
+            outputs=[delivery_heading, delivery_panel, editor_export_group],
+            queue=False,
             api_name=False,
         )
         approve_exception_btn.click(

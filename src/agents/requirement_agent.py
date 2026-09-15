@@ -10,7 +10,7 @@ requirement_agent.py — Agent 1: 需求理解
   - "剪一下" → 多长？什么风格？聚焦哪些内容？
   - 通过精心设计的 System Prompt，让 GPT 来"补全"用户的意图
 
-面试常考：Prompt Engineering
+提示词设计：
   这个文件的核心是 SYSTEM_PROMPT。一个好的 Prompt：
   1. 定义角色（你是谁）
   2. 定义任务（你要做什么）
@@ -160,42 +160,25 @@ class RequirementAgent(BaseAgent):
         submitted_by: Optional[str] = None,
         overrides: Optional[dict] = None,
     ) -> RequirementCompilation:
-        """把自然语言编译为可修改、可审核、可追溯的需求任务书。
+        """先建立不臆测的任务书骨架，素材转录后再由 AI 提出业务问题。
 
-        ``run`` 保留给旧流水线使用；新工作流从这里开始。模型负责抽取，
-        版本、验收规则和用户可见执行说明由确定性代码建立，避免隐藏 Prompt
-        成为任务的唯一事实来源。
+        快速工作流不在看见素材前调用 LLM。用户明确说出的值由代码抽取；
+        没有说出的内容保留为待确认槽位，并在同一审核页展示。
+        ``run`` 仅保留给旧接口和独立演示使用。
         """
         if scenario not in {"school", "enterprise"}:
             raise ValueError("scenario 只能是 school 或 enterprise")
-        raw_text = user_input.strip()
-        if not raw_text:
-            raise ValueError("请先填写剪辑需求")
+        raw_text = user_input.strip() or "请根据素材整理一版可审核的剪辑方案"
 
         brief = RequirementBrief(
             scenario=scenario,
             raw_text=raw_text,
             submitted_by=submitted_by,
         )
-        mode = "llm_generated"
+        mode = "material_assisted"
         warnings: list[str] = []
-        try:
-            requirement = self.run(raw_text)
-        except RequirementParsingError:
-            mode = "manual_required"
-            warnings.append(
-                "AI 未能完成需求解析；当前草稿仅使用表单显式值和中性占位值，必须由用户核对后才能继续。"
-            )
-            requirement = VideoRequirement(
-                target_duration=300,
-                video_type="general",
-                style="formal",
-                focus_keywords=[],
-                need_subtitles=True,
-                need_bgm=False,
-            )
+        requirement = self._extract_explicit_requirement(raw_text)
         requirement = self._apply_overrides(requirement, overrides)
-        domain = get_domain_config(scenario)
         items = self._build_requirement_items(raw_text, requirement)
         # 是否需要追问、具体问什么，由独立的澄清 Agent 在任务书草稿完成后判断。
         # 编译器不再通过固定模板替 AI 提问。
@@ -203,7 +186,7 @@ class RequirementAgent(BaseAgent):
         spec = RequirementSpec(
             brief_id=brief.id,
             purpose=self._infer_purpose(raw_text, scenario),
-            audience=domain["audience"],
+            audience=self._infer_audience(raw_text),
             video_type=requirement.video_type,
             style=requirement.style,
             need_subtitles=requirement.need_subtitles,
@@ -214,11 +197,6 @@ class RequirementAgent(BaseAgent):
             open_questions=questions,
         )
         visible_instruction = self._build_visible_instruction(spec)
-        if mode == "manual_required":
-            visible_instruction = (
-                "注意：AI 需求解析失败。以下执行说明由原始需求、表单显式值和中性占位值生成，"
-                "尚未代表用户确认。\n" + visible_instruction
-            )
         execution = ExecutionBrief(
             requirement_spec_id=spec.id,
             requirement_spec_version=spec.version,
@@ -230,7 +208,7 @@ class RequirementAgent(BaseAgent):
             spec,
             scenario=scenario,
             overrides=overrides,
-            manual_required=mode == "manual_required",
+            manual_required=False,
         )
         self.log(f"已编译需求任务书 v{spec.version}，包含 {len(items)} 条要求和 {len(questions)} 个待确认问题")
         return RequirementCompilation(
@@ -241,6 +219,54 @@ class RequirementAgent(BaseAgent):
             mode=mode,
             warnings=warnings,
             slots=slots,
+        )
+
+    @staticmethod
+    def _extract_explicit_requirement(raw_text: str) -> VideoRequirement:
+        """只抽取原文明确出现的值；未知项使用中性机器值并标为待确认。"""
+        minute_match = re.search(r"(\d+(?:\.\d+)?)\s*分钟", raw_text)
+        second_match = re.search(r"(\d+(?:\.\d+)?)\s*秒", raw_text)
+        if minute_match:
+            duration = int(float(minute_match.group(1)) * 60)
+        elif second_match:
+            duration = int(float(second_match.group(1)))
+        else:
+            duration = 300
+        duration = max(30, min(600, duration))
+
+        if any(word in raw_text for word in ("运动会", "体育", "田径", "球赛")):
+            video_type = "sports"
+        elif any(word in raw_text for word in ("竞赛", "演讲", "辩论", "答辩")):
+            video_type = "competition"
+        elif any(word in raw_text for word in ("会议", "讲座", "培训", "访谈", "采访")):
+            video_type = "meeting"
+        else:
+            video_type = "general"
+
+        style = "general"
+        for words, value in (
+            (("燃", "热血", "快节奏"), "exciting"),
+            (("正式", "庄重", "官方"), "formal"),
+            (("温馨", "感人", "温情"), "warm"),
+            (("搞笑", "轻松", "有趣"), "funny"),
+        ):
+            if any(word in raw_text for word in words):
+                style = value
+                break
+
+        focus_keywords: list[str] = []
+        for pattern in (
+            r"(?:重点|主要)\s*(?:保留|突出|要)?\s*([^。；，,]{2,30})",
+            r"必须\s*(?:保留|包含)?\s*([^。；，,]{2,30})",
+        ):
+            focus_keywords.extend(match.strip() for match in re.findall(pattern, raw_text))
+        return VideoRequirement(
+            target_duration=duration,
+            video_type=video_type,
+            style=style,
+            focus_keywords=list(dict.fromkeys(focus_keywords))[:8],
+            need_subtitles="不要字幕" not in raw_text and "无需字幕" not in raw_text,
+            need_bgm=any(word in raw_text for word in ("背景音乐", "配乐", "BGM", "bgm")),
         )
 
     @staticmethod
@@ -311,32 +337,46 @@ class RequirementAgent(BaseAgent):
         publish_match = re.search(r"(公众号|抖音|视频号|内网|汇报|宣传|官网)", raw_text)
         # UI 会始终提交 focus_keywords；空列表只代表用户尚未填写，不能视为已确认。
         focus_explicit = bool(explicit.get("focus_keywords"))
-        duration_explicit = "target_duration" in explicit
-        style_explicit = "style" in explicit
+        duration_explicit = "target_duration" in explicit or bool(
+            re.search(r"\d+(?:\.\d+)?\s*(?:分钟|秒)", raw_text)
+        )
+        style_explicit = "style" in explicit or any(
+            word in raw_text
+            for word in (
+                "燃", "热血", "快节奏", "正式", "庄重", "官方",
+                "温馨", "感人", "温情", "搞笑", "轻松", "有趣",
+            )
+        )
+        purpose_explicit = spec.purpose != "待你确认"
+        audience_explicit = spec.audience != "待你确认"
         domain = get_domain_config(scenario)
         return [
             RequirementSlot(
                 key="purpose",
                 label="视频用途",
                 value=spec.purpose,
-                status="inferred",
-                source_type="llm" if not manual_required else "domain_config",
+                status="confirmed" if purpose_explicit else "missing",
+                source_type="user_input" if purpose_explicit else "llm",
                 source_ref=spec.id,
             ),
             RequirementSlot(
                 key="audience",
                 label="目标受众",
                 value=spec.audience,
-                status="inferred",
-                source_type="domain_config",
-                source_ref=scenario,
+                status="confirmed" if audience_explicit else "missing",
+                source_type="user_input" if audience_explicit else "llm",
+                source_ref="raw_text",
             ),
             RequirementSlot(
                 key="target_duration",
                 label="目标时长",
                 value=spec.target_duration,
                 status="confirmed" if duration_explicit else "inferred",
-                source_type="form" if duration_explicit else "llm",
+                source_type=(
+                    "form" if "target_duration" in explicit
+                    else "user_input" if duration_explicit
+                    else "llm"
+                ),
                 source_ref=spec.id,
             ),
             RequirementSlot(
@@ -346,6 +386,20 @@ class RequirementAgent(BaseAgent):
                 status="confirmed" if style_explicit else "inferred",
                 source_type="form" if style_explicit else "llm",
                 source_ref=spec.id,
+            ),
+            RequirementSlot(
+                key="need_bgm",
+                label="背景音乐",
+                value=spec.need_bgm,
+                status=(
+                    "confirmed"
+                    if any(word in raw_text for word in (
+                        "背景音乐", "配乐", "BGM", "bgm", "不要音乐", "无需音乐",
+                    ))
+                    else "missing"
+                ),
+                source_type="user_input",
+                source_ref="raw_text",
             ),
             RequirementSlot(
                 key="focus_keywords",
@@ -385,11 +439,30 @@ class RequirementAgent(BaseAgent):
 
     @staticmethod
     def _infer_purpose(raw_text: str, scenario: str) -> str:
+        if any(word in raw_text for word in ("访谈", "采访")):
+            return "访谈精华摘要"
         if "汇报" in raw_text:
             return "活动成果汇报视频"
+        if "回顾" in raw_text or "集锦" in raw_text:
+            return "学校活动回顾视频" if scenario == "school" else "企业活动回顾视频"
         if any(word in raw_text for word in ("宣传", "发布", "公众号", "视频号")):
             return "活动对外宣传回顾视频"
-        return "学校活动回顾视频" if scenario == "school" else "企业活动回顾视频"
+        return "待你确认"
+
+    @staticmethod
+    def _infer_audience(raw_text: str) -> str:
+        audience_patterns = (
+            (("家长",), "师生与家长"),
+            (("学生", "师生"), "师生"),
+            (("客户", "合作伙伴"), "客户与合作伙伴"),
+            (("员工", "内部"), "企业内部员工"),
+            (("领导", "汇报"), "相关负责人"),
+            (("公众", "对外"), "社会公众"),
+        )
+        for words, label in audience_patterns:
+            if any(word in raw_text for word in words):
+                return label
+        return "待你确认"
 
     @staticmethod
     def _build_visible_instruction(spec: RequirementSpec) -> str:
@@ -404,6 +477,7 @@ class RequirementAgent(BaseAgent):
             "exciting": "精彩有节奏",
             "warm": "温馨自然",
             "funny": "轻松活泼",
+            "general": "由你在任务书中确认",
         }
         item_lines = [
             f"- **{priority_names[item.priority]}：** {item.description}"

@@ -25,7 +25,6 @@ Python 知识点：
 from __future__ import annotations
 
 from src.agents.base import BaseAgent
-from src.tools.llm import call_llm
 from src.tools.whisper import WhisperTool
 from src.tools.ffmpeg import FFmpegTool
 from src.config import WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_MODEL_SIZE
@@ -195,26 +194,17 @@ class AnalysisAgent(BaseAgent):
         duration: float,
         requirement: VideoRequirement,
     ) -> str:
-        """用 LLM 生成视频内容的一句话摘要"""
-        # 取开头、中间、结尾各一段文字作为样本
+        """从转录中生成即时概览；内容判断留给后续一次批量 LLM。"""
         sample_indices = [0, len(transcript) // 2, len(transcript) - 1]
-        sample_texts = []
+        sample_texts: list[str] = []
         for idx in sample_indices:
             if 0 <= idx < len(transcript):
-                sample_texts.append(transcript[idx].text)
-
-        sample = " | ".join(sample_texts)
-
-        try:
-            summary = call_llm(
-                system_prompt="用一句话概括视频内容，不超过 50 字。",
-                user_message=f"视频时长 {duration/60:.0f} 分钟，类型 {requirement.video_type}。片段样本: {sample}",
-                return_json=False,
-                temperature=0.3,
-            )
-            return summary[:100]  # 截断
-        except Exception:
-            return f"一段 {duration/60:.0f} 分钟的{requirement.video_type}视频"
+                text = transcript[idx].text.strip()
+                if text and text not in sample_texts:
+                    sample_texts.append(text)
+        if not sample_texts:
+            return f"约 {duration/60:.1f} 分钟，未识别到清晰语音"
+        return (" / ".join(sample_texts))[:120]
 
     def _build_keyword_timeline(
         self,
